@@ -45,11 +45,23 @@ git fetch origin --quiet && git rev-parse origin/<trunk>          # 1. trunk sha
 gh issue list --state open --limit 100 --json number,updatedAt,labels \
   | shasum -a 256 | cut -c1-16                                    # 2. backlog digest
 NWO=$(gh repo view --json nameWithOwner -q .nameWithOwner)        # 3. dependency digest
-gh api graphql -F owner="${NWO%%/*}" -F name="${NWO##*/}" -f query='
+OUT=$(gh api graphql -F owner="${NWO%%/*}" -F name="${NWO##*/}" -f query='
   query($owner:String!,$name:String!){ repository(owner:$owner,name:$name){
-    issues(states:OPEN,first:100){ nodes{ number issueDependenciesSummary{ blockedBy } } } } }' \
-  -q '.data.repository.issues.nodes[]|"\(.number):\(.issueDependenciesSummary.blockedBy)"' \
-  | shasum -a 256 | cut -c1-16
+    issues(states:OPEN,first:100){ totalCount pageInfo{ hasNextPage }
+      nodes{ number blocking(first:1){ totalCount }
+        blockedBy(first:20){ totalCount nodes{ number state repository{ nameWithOwner } } } } } } }' \
+  -q '"COV \(.data.repository.issues.totalCount) \(.data.repository.issues.nodes|length) \(.data.repository.issues.pageInfo.hasNextPage)",
+      (.data.repository.issues.nodes[]|"DEP \(.number):\(.blockedBy.totalCount):\(.blocking.totalCount)"),
+      (.data.repository.issues.nodes[]|. as $i|.blockedBy.nodes[]|"BY \($i.number) \(.repository.nameWithOwner)#\(.number) \(.state)")')
+
+COV=$(printf '%s\n' "$OUT" | grep '^COV ')                        # ← the read's own receipt
+read -r _ TOTAL FETCHED MORE <<< "$COV"                           # zsh: never `set -- $COV`
+if   [ -z "$COV" ]; then echo "REFUSING to digest: dependency read returned nothing → full pass"
+elif [ "$TOTAL" != "$FETCHED" ] || [ "$MORE" != false ]; then
+     echo "TRUNCATED: $FETCHED of $TOTAL open issues → paginate, full pass (so do inputs 2 and §1)"
+else printf '%s\n' "$COV" "$(printf '%s\n' "$OUT" | grep -e '^DEP ' -e '^BY ' | sort)" \
+       | shasum -a 256 | cut -c1-16
+fi
 python3 -c 'import json,os,sys                                    # 4. claim digest (local, 0 calls)
 r=os.path.realpath(sys.argv[1]); s=json.load(open(os.path.expanduser("~/.colab/state.json")))
 print(sorted(k for k,v in s.get("claims",{}).items() if os.path.realpath(v["repo"])==r),
@@ -91,12 +103,78 @@ cost on a run that *does* proceed — §1 needs that list anyway.
   *per issue*; input 3 is the entire graph in one query. Drop it and the fingerprint goes
   blind to precisely the data the §5 readiness gate turns on — a new blocker would be
   reported as `free (checked)` forever.
+- **Input 3 digests BOTH directions, because an inbound edge is not visible on this side's
+  `blockedBy`.** An edge written from another repository *toward* an issue here moves that
+  issue's `blocking` count and never touches its `blockedBy`. Measured: an open issue whose
+  `blocking` went 0 → 1 — a consumer elsewhere declaring itself blocked by it — produced a
+  **byte-identical** one-directional line (`<n>:0`) before and after, and two inbound edges
+  once survived a full triage cycle unnoticed. Under a ping loop that means the repo
+  acquires an obligation (one of its issues is now on somebody's critical path) and triage
+  never says so. The two-way line makes the fingerprint deliberately more sensitive, on the
+  same reasoning input 5 already uses for pushes: what this repo *owes* changed.
+- **Digest the connections' `totalCount`, NOT `issueDependenciesSummary` — the summary
+  lags behind the graph.** Measured, both directions, inside a *single* response: seconds
+  after a `blocked_by` POST, `blockedBy(first:n){totalCount}` already read `1` while
+  `issueDependenciesSummary.blockedBy` still read `0`; seconds after the matching DELETE the
+  connections read `0` while the summary still read the pre-delete `1`. It converges within
+  a few seconds, so nothing is broken — but a digest built from the summary can record a
+  state that never existed at any instant, and a fingerprint stored from it "changes" on the
+  next ping for no reason. The connections are the authority; the summary is a cache of them.
+  (The same fact protects §0.2's read-before-write rule: `gh issue view <N> --json blockedBy`
+  reads the *connection*, so a POST is not re-issued against a stale zero.)
+- **The `BY` lines are why the blocker detail is fetched here and not again in §5.** §5.1
+  needs each open blocker's number, state and home repo; input 3 is already querying that
+  subgraph, so one request serves both. Two requests would cost a round trip *and* a
+  correctness risk: the graph can move between them, leaving the digest and the report
+  disagreeing with no way to tell which is authoritative. Including each blocker's `state`
+  in the digested material is deliberate — a blocker in *another* repo closing moves no
+  other input, and it is exactly the change that flips a dependent from `blocked` to ready.
+- **Never digest a read you did not verify arrived.** `shasum` of empty input is a stable,
+  plausible 16-hex value — **`e3b0c44298fc1c14`**. So any pipeline whose producer emits
+  nothing yields a well-formed and *constant* digest: it matches on every later run and the
+  triage reports "nothing has changed" forever. Learn that constant by sight; seeing it is
+  never good news. This is the mechanism behind *"never report nothing changed from a cache
+  you could not read"* below, and it binds all five inputs: every digest needs a receipt that
+  its read actually happened —
+  input 3's is the `COV` line, which is emitted by the same query and cannot be produced by
+  a failed one. Note the failure is *not* hypothetical for want of `jq`: shipped paths use
+  `gh`'s built-in `-q` (and the audit's `--jq`) for exactly this reason, but an external
+  `jq` is not universally installed — piping this query into one on a machine without it
+  returned that constant, silently.
+- **No silent caps — say what was dropped.** `first:100` here, `--limit 100` in input 2 and
+  in §1, all bounded and none previously checked; past 100 open issues the digest covers a
+  partial set, so movement in the tail reads as "unchanged" and the short-circuit then hides
+  it. `totalCount` and `pageInfo { hasNextPage }` are free in the same request, which makes
+  truncation loud and gives all three bounded reads one authoritative count to check against.
+  **Both guards fall toward work, never toward silence:** each prints instead of a digest, and
+  no digest means no match, which means a **full pass** — not a stop. A truncated backlog
+  therefore stops short-circuiting until someone paginates, and that is the intended price:
+  a partial digest that *matched* would report "nothing has changed" while blind to the tail,
+  which is the failure being fixed, merely relocated. Keep the three branches mutually
+  exclusive — written as separate `[ … ] || echo` lines, an empty read prints the refusal and
+  then a second, garbage line (`TRUNCATED:  of  open issues`) from the unset variables it
+  just proved it does not have. Verified by running it with a producer that emits nothing.
+- **Sort before hashing.** The digest hashes what the server returned, in the order it
+  returned it. Order is stable in practice today (verified across repeated calls) but is not
+  a documented guarantee, and a reordering would spend a full pass to conclude nothing
+  changed. `| sort` costs nothing and removes the dependency on undocumented behaviour.
 - **Pass owner/name to `gh api graphql` as variables, never inline.** Input 3 uses
   `-F owner="${NWO%%/*}" -F name="${NWO##*/}"` with a parameterised `query($owner,$name)`
   for a reason past style: a query with the repo spelled into the text
   (`repository(owner:"…",name:"…")`) puts the repo name in the command itself and trips the
   privacy backstop. The variable form keeps the name out of the argv — copy it in every
   `gh api graphql` call this skill has or gains.
+  **The practical consequence, worth knowing before it surprises you:** where a wrapper
+  classifies a command by its *destination*, a `gh api graphql` call has no destination in
+  argv at all — it lives inside the query text — so such a call cannot be resolved that way
+  and will attract the strictest classification available. That is the correct default and
+  not a thing to work around. Keep the call in its **own invocation, as a pure read, with no
+  local writes co-located in the same command**, so a strict classification can never block
+  unrelated work. (Two portability notes found while testing input 3: `-F query=@file` and
+  `-F query=@-` both work if you would rather keep the query out of argv entirely, but
+  `-f query=@file` does **not** — `gh` sends the literal `@` and the server rejects it. And
+  `set -- $VAR` does not word-split under zsh, where it yields one argument to bash's three,
+  so parse the `COV` line with `read` or `awk`, never with positional parameters.)
 - **Input 5 exists because §5.1 turned a branch push into a readiness signal.** A blocker
   whose code gets pushed moves a dependent from `blocked` to soft-ready — and moves none of
   inputs 1-4: trunk is untouched, the issues are untouched, the edge is untouched, and the
@@ -170,6 +248,20 @@ gh issue list --state open --label in-progress            # …of which, taken
 `--state open` is right here — unlike code-start's lookup, which needs `--state all`
 because it is answering a different question (does a memory exist?) rather than this
 one (what is left to do?).
+
+**`--limit 100` is a cap, so say when you hit it.** A bounded pass that does not report what
+it dropped is the failure §0 forbids, arriving one section later: past 100 open issues this
+gathers a partial backlog and everything downstream — grouping, ordering, "nothing left to
+do" — is silently computed over a subset. §0's `COV` line already carries the authoritative
+`totalCount`; compare it to what you actually received and say so out loud:
+
+```sh
+gh issue list --state open --limit 100 --json number -q 'length'   # vs COV's totalCount
+```
+
+Equal ⇒ full coverage. Fewer ⇒ raise the limit or paginate, and until you do, state the
+coverage in the report — a triage over 100 of 140 issues is a useful answer, but only if it
+admits which question it answered.
 
 **Scope: this repo. Not the fleet.** Every `code-*` skill is one repo — that is the
 family's whole shape, and a single skill quietly going wide is the kind of
@@ -438,7 +530,10 @@ nothing (`CONVENTIONS.md` §5, *Readiness*).
 So for each open blocker, ask what evidence exists that its work is real:
 
 ```sh
-gh issue view <B> --json state,number                      # closed → clears, full stop
+# §0 input 3 already returned each blocker as `BY <dependent> <owner>/<repo>#<B> <STATE>` —
+# read that, do not re-query it. A second fetch of the same subgraph can disagree with the
+# digest that was stored from the first, and nothing then says which one to believe.
+gh issue view <B> --json state,number                      # only for a blocker §0 could not cover
 git fetch --prune --quiet
 git branch -r --list "*-<B>"                               # its branch, by trailing number (§3)
 colab landed --branch origin/<that-branch>                 # landed · cargo · unknown

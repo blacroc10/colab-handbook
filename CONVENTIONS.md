@@ -414,6 +414,17 @@ to ours in every way. Nothing errors, and the readiness gate then reads a perfec
 blocker. **Read `blockedBy` back after every write** — a dependency you did not intend is
 invisible at the moment you create it.
 
+**Read that confirmation from the `blockedBy` / `blocking` connections, never from
+`issueDependenciesSummary` — the summary lags the graph.** Measured both directions, and
+within a *single* response: seconds after a `blocked_by` POST, `blockedBy(first:n){totalCount}`
+read `1` while `issueDependenciesSummary.blockedBy` in the same payload still read `0`;
+seconds after the matching DELETE, the connections read `0` while the summary still read the
+pre-delete count. It converges in a few seconds, so the summary is not wrong so much as
+**late** — but a read-back that consults it can report a write as not-landed and invite a
+duplicate POST, and any digest built on it can record a state that never existed at any
+instant. The connections are the record; the summary is a cache of them, useful only where a
+few seconds of staleness is acceptable.
+
 **"No blockers" and "nobody checked for blockers" are the same empty list**, so the second
 needs a marker of its own. Absent relationship data means nobody has looked — it must never
 be read as "ready":

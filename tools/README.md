@@ -419,7 +419,14 @@ colab config set journal false     # removes the key; the existing file is left 
 | `worktree.removed` / `claim.removed` / `port.freed` | a record leaves state | **`livedMs`**, plus the record as it was |
 | `journal.truncated` | the file hit its size cap | `droppedBytes` |
 
-What it is for — each of these is a query over the file alone, and none is answerable without it:
+What it is for — each of these is a query over the file alone, and none is answerable without it.
+The examples use an **external `jq`**, which is not part of anything this repo ships and is not
+present on every machine: `colab` itself parses its own JSON, and where a shipped path needs a
+filter it uses `gh`'s built-in (`-q` / `--jq`). So these are one-off queries you run by hand, and
+if `jq` is missing they emit nothing — which is silent, and harmless only because no digest is
+taken of the output. Do not lift the pattern into a pipeline whose result is hashed or compared:
+`shasum` of empty input is a stable, plausible value (`e3b0c44298fc1c14`) that reads as a
+successful, unchanging answer forever.
 
 ```sh
 # how long did each worktree live, and was anything merged first?
