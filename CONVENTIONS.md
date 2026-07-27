@@ -15,7 +15,7 @@ tool you must adopt.
 > **Why enforcement is weak by design:** GitHub branch protection is unavailable on our
 > private repos (`403 Upgrade to GitHub Pro`). We cannot make `main` unpushable. Nothing here
 > is enforced by GitHub settings. Conformance is checked *from outside* by the audit tool
-> ([§8](#8-conformance)), and otherwise rests on habit.
+> ([§8](#8-conformance-and-reconciliation)), and otherwise rests on habit.
 
 ---
 
