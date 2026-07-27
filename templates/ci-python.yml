@@ -71,8 +71,22 @@ jobs:
           # GITLEAKS_LICENSE for repositories owned by an organization (free only for
           # personal repos). The release binary itself is MIT and has no such gate.
           # Repos also carry a local pre-commit gitleaks hook; this is the second layer.
+          # The asset is OS/arch-specific, so resolve both from uname instead of
+          # assuming the GitHub-hosted default: a hardcoded linux_x64 binary on a
+          # macOS self-hosted runner is an ELF the kernel cannot exec, and the step
+          # fails with exit 126 rather than anything mentioning the platform.
+          case "$(uname -s)" in
+            Darwin) os=darwin ;;
+            Linux)  os=linux ;;
+            *) echo "unsupported OS: $(uname -s)" >&2; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            arm64|aarch64) arch=arm64 ;;
+            x86_64|amd64)  arch=x64 ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
           curl -sSL -o gitleaks.tar.gz \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${os}_${arch}.tar.gz"
           # Into $RUNNER_TEMP, not /usr/local/bin: no sudo, no global write — the same
           # step then works on BOTH GitHub-hosted and shared self-hosted runners
           # (a shared runner is infrastructure; jobs must not mutate it).

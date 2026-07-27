@@ -67,8 +67,20 @@ jobs:
         run: |
           # NOT gitleaks/gitleaks-action@v2 — it demands a paid GITLEAKS_LICENSE for
           # organization-owned repositories. The plain release binary is MIT.
+          # Resolve OS/arch from uname — a hardcoded linux_x64 binary on a macOS
+          # self-hosted runner cannot exec, and fails as a bare exit 126.
+          case "$(uname -s)" in
+            Darwin) os=darwin ;;
+            Linux)  os=linux ;;
+            *) echo "unsupported OS: $(uname -s)" >&2; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            arm64|aarch64) arch=arm64 ;;
+            x86_64|amd64)  arch=x64 ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
           curl -sSL -o gitleaks.tar.gz \
-            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_${os}_${arch}.tar.gz"
           # Into $RUNNER_TEMP, not /usr/local/bin: no sudo, no global write — the same
           # step then works on BOTH GitHub-hosted and shared self-hosted runners
           # (a shared runner is infrastructure; jobs must not mutate it).
