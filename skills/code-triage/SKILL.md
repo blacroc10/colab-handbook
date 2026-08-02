@@ -1,6 +1,6 @@
 ---
 name: code-triage
-description: "Decide what to work on next in ONE repo. Takes every open Issue, discards the ones already shipped and the ones someone else holds, groups what must move together (issues touching the same files MUST share a branch), orders what remains by blast radius, and says which groups can be started RIGHT NOW — including whether the repo's trunk CI is alive enough to merge into. Outputs claim + branch commands that feed straight into code-start. Flags a group judged genuinely hard with a needs-plan label + one-line reason, for code-plan to draft against later — never a plan of its own. Cheap to re-run: a no-change ping short-circuits in three calls. Trigger phrases: 'what should I work on', 'triage the issues', 'what can we start', 'plan the next session', 'group the open issues', 'what is ready to pick up', 'sort the backlog'; and — when this session's last act was a triage — the re-ping forms 'again', 'anything new?', 'check again', 'anything to pick up yet?', or a bare 'go'. Runs before code-start; pairs with code-start and code-wrap."
+description: "Decide what to work on next in ONE repo. Takes every open Issue, discards the ones already shipped and the ones someone else holds, groups what must move together (issues touching the same files MUST share a branch), orders what remains by blast radius, and says which groups can be started RIGHT NOW — including whether the repo's trunk CI is alive enough to merge into. Outputs claim + branch commands that feed straight into code-start. Flags a group judged genuinely hard with a needs-plan label + one-line reason, for code-plan to draft against later — never a plan of its own. Also asks, per ready group, whether the work is batch-mechanical with a usable oracle, and tags the minority that qualifies with a mechanical-lane label + suggested batch size, for a cheap mechanical-work engine to pick up — never routes or dispatches it itself. Cheap to re-run: a no-change ping short-circuits in three calls. Trigger phrases: 'what should I work on', 'triage the issues', 'what can we start', 'plan the next session', 'group the open issues', 'what is ready to pick up', 'sort the backlog'; and — when this session's last act was a triage — the re-ping forms 'again', 'anything new?', 'check again', 'anything to pick up yet?', or a bare 'go'. Runs before code-start; pairs with code-start and code-wrap."
 ---
 
 # code-triage — what should we work on next?
@@ -622,6 +622,17 @@ READY* fix/import-fixes-115-114-113   #115 #114 #113
 Name the branch in the note. Without it the operator cannot check the claim, and "the
 code exists somewhere" is the kind of reassurance that sends someone to write it twice.
 
+A group judged **mechanical + oracle-checkable** (the verdict below, after §5) carries one
+more line — present only on the minority that earns it, absent from every other group:
+
+```
+READY  chore/relabel-status-columns-140-139-138   #140 #139 #138
+       why: cheap and unblocking; trunk CI green 2h ago
+       files: app/Reports/*.php (11 files, same rename across each)
+       mechanical: yes — batch of 4; oracle: `php artisan test --filter=ReportColumns`
+       start: colab claim 140 139 138 --worktree relabel-status-columns-140-139-138
+```
+
 Then, briefly:
 
 - **blocked** — one line each, naming the blocker and who could clear it.
@@ -706,6 +717,60 @@ session working only this issue would not see from where you are sitting>"
   `needs-plan` applied by default, on the theory that a plan can never hurt, is the same
   signal as `needs-plan` on nothing at all — it stops meaning anything a session can act on.
 
+### Then flag delegable groups with `mechanical-lane` — a batch size, not a routing decision (#93)
+
+A fleet that runs a second, cheap engine for batch-mechanical work only feeds it when
+someone mid-session happens to remember it exists — which trends toward zero use, the
+same failure `needs-plan` exists to prevent from the opposite direction (there, a group
+too hard to hand to the default engine untagged; here, a group too easy to deserve it).
+Triage is the one moment the whole backlog is in view, so it is the only place these
+groups can be *assembled* rather than encountered one issue at a time.
+
+For each ready or soft-ready group, ask one question, alongside — never instead of — the
+readiness verdict §5 already computed:
+
+> **Mechanical + oracle?** — is this group's work batch-mechanical (pattern conversion
+> across files, boilerplate, spec'd translations, data-file generation) **and** is there
+> an existing test command — or a cheaply-written one — that adjudicates it without
+> human judgment?
+
+Both yes → tag it. Anything else — including genuine doubt about whether the oracle
+actually catches a wrong answer — leave it untagged; the column's job is to force the
+question to be *asked*, never to lower the bar that decides it. Untagged is the default,
+same as an unflagged group defaults to the expensive lane today — this flag only ever
+narrows that default, it never widens it.
+
+```sh
+gh label create mechanical-lane --color 1D76DB \
+  --description "Triage judged this batch-mechanical with a usable oracle — a candidate for the cheap engine lane, not the default one" 2>/dev/null || true
+gh issue edit <lead-issue> --add-label mechanical-lane
+gh issue comment <lead-issue> --body "mechanical-lane: <one-line why — the pattern being
+converted or generated, and the oracle command that adjudicates it>
+Suggested batch size: <N> — <why that size, not one big batch>"
+```
+
+- **Idempotent, same as `needs-plan` and §3's group evidence (§0.2).** The label add is
+  naturally idempotent; grep existing comments for `mechanical-lane:` before posting a
+  second reason — re-post only if the pattern or the oracle actually changed.
+- **Not a readiness gate.** Same posture as `needs-plan`: this label never blocks a group
+  from being reported ready, and never substitutes for the §5 gate. A group carrying
+  both `mechanical-lane` and `needs-plan` is a contradiction worth a second look, not a
+  state to write mechanically — a group hard enough to need a drafted plan first is not
+  the batch-mechanical shape this flag describes.
+- **Suggest a batch size, do not dictate the invocation.** Which engine backs the lane,
+  how it is invoked, and its exact batch mechanics are per-fleet and deliberately outside
+  this skill's scope (`CONVENTIONS.md` has none of that either) — the suggested size is a
+  number and a one-line reason, not a runbook. Smaller batches have measurably
+  outperformed one large batch in at least one adopting fleet's history; default toward
+  smaller when unsure.
+- **Most groups get nothing.** The label is for the minority genuinely both mechanical
+  and oracle-checkable. Applied by default, on the theory that tagging can never hurt, it
+  stops meaning anything a downstream lane can act on — the identical failure mode
+  `needs-plan` already warns against, one section up.
+- **Report it too.** A ready group carrying this verdict gets one extra line in §6, the
+  same way a soft-ready group carries its `note:` line — a session (or a router reading
+  the report instead of a human) should not have to re-derive the verdict from the label.
+
 Hand the top group to **code-start**, which will re-verify the claim before taking it.
 
 ## Verify complete
@@ -735,5 +800,9 @@ Hand the top group to **code-start**, which will re-verify the claim before taki
 - Every group judged hard got `needs-plan` on its lead issue plus a one-line reason
   comment — and it landed on the minority actually judged hard, not on every group as a
   default.
+- Every ready or soft-ready group was asked the mechanical + oracle question; every yes
+  got `mechanical-lane` on its lead issue plus a one-line reason and suggested batch
+  size, and a `mechanical:` line in the §6 report — and, same as `needs-plan`, it landed
+  on the minority actually both mechanical and oracle-checkable, not on every group.
 - Anything surprising — a stale claim, a dead trunk CI, an epic whose table
   contradicts its title — is **reported**, not silently worked around.

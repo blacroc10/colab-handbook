@@ -572,10 +572,14 @@ for N in <harvested issue numbers>; do
   RUNG=$(sed -n 's/^rung: *//p' "$PLAN" | head -1)
   CAUSE=$(sed -n 's/^cause: *//p' "$PLAN" | head -1)
   mkdir -p "$(dirname ~/.colab/plan-journal.jsonl)"
-  printf '%s\n' "$(jq -nc --arg ts "$(date -u +%FT%TZ)" --argjson n "$N" \
-    --arg rung "${RUNG:-1}" --arg cause "${CAUSE:-none}" --arg verdict "$GRADE_VERDICT" \
-    '{ts:$ts, issue:$n, rung:$rung, cause:$cause, verdict:$verdict}')" >> ~/.colab/plan-journal.jsonl
-  rm -f "$PLAN"
+  python3 -c '
+import json, sys, datetime
+n, rung, cause, verdict = sys.argv[1:5]
+print(json.dumps({
+    "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "issue": int(n), "rung": rung, "cause": cause, "verdict": verdict,
+}))' "$N" "${RUNG:-1}" "${CAUSE:-none}" "$GRADE_VERDICT" >> ~/.colab/plan-journal.jsonl \
+    && rm -f "$PLAN"
 done
 ```
 
@@ -589,6 +593,17 @@ done
   frequencies, flag precision (flagged but the diff graded clean with no friction?), and
   flag recall (unflagged but a mid-session escalation caught it?) — the evidence to tune
   or retire the `needs-plan` mechanism. Nothing reads it automatically; a human greps it.
+- **Delete only after the journal line lands, and chain it — never split across
+  statements.** The append and the `rm` are one `&&`-joined command, not two lines, because
+  a compose that fails silently (wrong interpreter, a bad argument) must not let control
+  reach the delete. This is `python3`, not `jq`, on purpose (#96): `jq` was pulled in for
+  this one line and appears nowhere else this skill family actually depends on, while
+  `python3` is already an assumed interpreter elsewhere (`code-sweep` §1's worktree-filter
+  snippets) — so this removes an undeclared dependency rather than adding one more thing
+  every machine running this skill must have installed. Measured failure mode this
+  replaces: `jq` missing → the old `$(jq …)` command substitution failed, `printf` still
+  wrote a bare newline (exit 0) into the journal, and the un-chained `rm -f "$PLAN"` on the
+  next line still ran — the plan file was gone with no journal line to show for it.
 - **Delete only after the journal line lands**, and only issues with no plan file are a
   silent no-op here — a rung-0 session never had one, and this loop skips it correctly.
 
