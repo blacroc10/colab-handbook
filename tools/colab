@@ -2040,13 +2040,21 @@ claims from.
   - Claims referencing a worktree that isn't in state are orphans (same treatment).
   - Worktree-less claims older than TTL (default 24h, --ttl to change) are REPORTED, not
     auto-removed (they may be deliberate trunk claims). --prune removes them too and frees
-    any ports they own.
+    any ports they own. Under --sync, a worktree-less claim whose issue the tracker no longer
+    shows assigned+in-progress is ALSO flagged this way — with NO age floor (#111): a claim
+    provably dead on GitHub does not need to wait out the TTL to be reported. A repo \`gh\`
+    cannot reach is skipped for this check, never read as "nothing assigned".
   - Ports owned by a vanished worktree/claim are freed on --prune.
   - A record nothing can ACT on is drift too: a branch that is a role word (\`trunk\`) or resolves
     to no ref, or a worktree naming no directory. Not the same as DEAD — dead means the directory
     is gone, these name none — which is why it went unreported while \`landed\` answered unknown and
     \`ship\` merged with no \`Closes #N\`. --prune repairs only what a directory on disk proves
     (adopting its path and its checked-out branch); a branch nothing can see is never guessed.
+  - A \`pending\` claim stub (path is null, status \`pending\`) referenced by NO claim is deleted
+    outright on --prune, with NO TTL (#110). Its only job was shielding a claim from the orphan
+    pass above until \`worktree new\` replaced it; once no claim points at it that job is done and
+    it is provably garbage — no directory, no ports, no branch. A stub a claim STILL holds keeps
+    the TTL-gated report it always had (it may be mid-flight, between claim and \`worktree new\`).
   - A \`running\` worktree whose branch has landed on trunk (tree-contained, incl. squash merges) AND
     holds NO live claims is flipped to \`merged\` (recorded on --prune). ANY live claim keeps it
     running (an unfinished group sibling). \`merged\` worktrees still on disk are sweep candidates;
@@ -2071,10 +2079,13 @@ in a cleanup cron.
   --prune   apply the fixes (default: report only)
   --ttl N   hours before a worktree-less claim is flagged stale (default 24)
   --json    machine-readable report
-  --sync    ALSO check each repo's tracker for spent \`group:<key>\` labels (#85). Off by
-            default because it is the only network work doctor does — one \`gh label list\`
-            per repo, plus one membership call per group label — and doctor is otherwise
-            fleet-wide and instant. Same opt-in shape as \`colab claims --sync\`.
+  --sync    ALSO check each repo's tracker: spent \`group:<key>\` labels (#85), AND (#111)
+            whether each worktree-less claim's issue is still assigned+in-progress on
+            GitHub — the same predicate \`colab claims --sync --prune\` already applies by
+            hand, folded into the command people actually run automatically. Off by default
+            because it is the only network work doctor does — one \`gh issue list\` per repo
+            (reused from syncClaims's shape) plus the group-label calls — and doctor is
+            otherwise fleet-wide and instant. Same opt-in shape as \`colab claims --sync\`.
             With --prune, deletes the labels found SPENT (every member closed) — the
             back-fill for groups \`ship\`'s B4 teardown can never reach: ones spent before
             that feature existed, or closed by any route other than \`ship\`. A group with
@@ -2180,6 +2191,22 @@ function cmdDoctor(argv) {
   };
   const repoLive = (r) => !!r && fs.existsSync(r) && !!git.repoRoot(r);
 
+  // #111: the tracker-state predicate for worktree-less claims — computed OUTSIDE any lock, on
+  // purpose. Mirrors syncClaims's shape (`tools/colab` cmdClaims --sync): read-only network work
+  // (`gh issue list`) happens BEFORE state.mutate ever opens the lock, so --sync never holds it
+  // through a `gh` round trip. repoAbs -> Set<issueNum> | null (null = tracker unreachable — the
+  // caller must SKIP, never read that as "nothing assigned", which would reap every claim here).
+  const trackerCache = new Map();
+  if (opts.sync) {
+    const preview = state.loadState();
+    const repos = new Set(Object.values(preview.claims).filter((c) => !c.worktree).map((c) => c.repo));
+    for (const repoAbs of repos) {
+      if (!git.ghAvailable() || !git.originUrl(repoAbs)) { trackerCache.set(repoAbs, null); continue; }
+      const assigned = git.ghAssignedIssues(repoAbs);
+      trackerCache.set(repoAbs, assigned === null ? null : new Set(assigned));
+    }
+  }
+
   const apply = (fn) => opts.prune ? state.mutate(fn) : fn(state.loadState());
 
   apply((st) => {
@@ -2202,12 +2229,27 @@ function cmdDoctor(argv) {
         if (opts.prune) delete st.claims[k];
       }
     }
-    // 3. stale worktree-less claims (report only; prune if asked)
+    // 3. stale worktree-less claims (report only; prune if asked). Two INDEPENDENT predicates (#111):
+    //    AGE (always on) and TRACKER (only under --sync, using trackerCache computed above) — a claim
+    //    can fail either, both, or neither. Age is a proxy for "probably abandoned"; tracker is a
+    //    fact the age gate cannot see: an issue closed 20 minutes after being claimed is provably
+    //    dead on GitHub while still far under a 24h TTL. `trackerCache` already encodes the
+    //    unreachable-host skip (a repo `null` never counts as "not assigned" here).
     for (const [k, c] of Object.entries(st.claims)) {
       if (!c.worktree) {
         const age = hoursSince(c.created);
-        if (age > ttl) {
-          report.staleClaims.push({ issue: c.issue, repo: shortRepo(c.repo), ageHours: Math.round(age), host: c.host, session: c.session || '', sessionName: c.sessionName || '' });
+        const byAge = age > ttl;
+        let byTracker = false;
+        if (opts.sync && trackerCache.has(c.repo)) {
+          const assigned = trackerCache.get(c.repo);
+          if (assigned) byTracker = !assigned.has(normIssueNum(c.issue));
+        }
+        if (byAge || byTracker) {
+          report.staleClaims.push({
+            issue: c.issue, repo: shortRepo(c.repo), ageHours: Math.round(age), host: c.host,
+            session: c.session || '', sessionName: c.sessionName || '',
+            reason: byTracker ? (byAge ? 'age+tracker' : 'tracker') : 'age',
+          });
           if (opts.prune) {
             // free any ports owned by this claim
             for (const p of Object.keys(st.ports)) {
@@ -2250,6 +2292,7 @@ function cmdDoctor(argv) {
     for (const wt of Object.values(st.worktrees)) {
       const problems = [];
       let repairTo = null;
+      let deleteStub = false;
       const bp = records.branchProblem(wt.branch);
       if (bp) problems.push(bp);
       else if (wt.branch && repoLive(wt.repo) && !resolves(wt.repo, wt.branch)) {
@@ -2262,6 +2305,16 @@ function cmdDoctor(argv) {
           repairTo = expected;
         } else if (records.statusOf(wt) !== records.PENDING) {
           problems.push(`path is null while status is "${records.statusOf(wt)}" — it names no directory`);
+        } else if (!Object.values(st.claims).some((c) => c.worktree === wt.name)) {
+          // #110: a `pending` stub's only documented purpose (records.js) is to shield a claim from
+          // the orphan pass (pass 2 above) until `worktree new` replaces it. The moment no claim
+          // points at it, that purpose is spent and the row is provably garbage — no directory, no
+          // ports, no branch, nothing losable. NO TTL: age is the wrong predicate here (that's the
+          // branch below, for a stub a claim still holds); zero-claim is a fact, not a guess that
+          // gets more confident with time. `repairTo` never applies to this branch — a stub with no
+          // matching claim never had a real worktree, so there is nothing on disk to adopt.
+          problems.push(`${records.PENDING} claim stub referenced by ZERO claims — unreachable, no TTL`);
+          deleteStub = true;
         } else if (hoursSince(wt.created) > ttl) {
           problems.push(`${records.PENDING} claim stub ${Math.round(hoursSince(wt.created))}h old — the worktree was never created`);
         }
@@ -2282,6 +2335,9 @@ function cmdDoctor(argv) {
           }
           entry.repaired = { path: repairTo, branch: real };
         }
+      } else if (opts.prune && deleteStub) {
+        delete st.worktrees[wt.name];
+        entry.repaired = { deleted: true };
       }
       report.brokenRecords.push(entry);
     }
@@ -2413,8 +2469,13 @@ function cmdDoctor(argv) {
     for (const c of report.orphanClaims) print(`  ${c.issue} [${c.repo}] → missing worktree "${c.worktree}"`);
   }
   if (report.staleClaims.length) {
-    print(`${opts.prune ? 'Pruned' : 'Flagged'} ${report.staleClaims.length} stale worktree-less claim(s) (> ${ttl}h):`);
-    for (const c of report.staleClaims) print(`  ${c.issue} [${c.repo}] age=${c.ageHours}h host=${c.host}${displayIdentity(c.sessionName, c.session) ? ` session=${displayIdentity(c.sessionName, c.session)}` : ''}`);
+    print(`${opts.prune ? 'Pruned' : 'Flagged'} ${report.staleClaims.length} stale worktree-less claim(s):`);
+    for (const c of report.staleClaims) {
+      const why = c.reason === 'tracker' ? 'no longer assigned+in-progress on GitHub'
+        : c.reason === 'age+tracker' ? `age=${c.ageHours}h (> ${ttl}h) + no longer assigned+in-progress on GitHub`
+          : `age=${c.ageHours}h (> ${ttl}h)`;
+      print(`  ${c.issue} [${c.repo}] ${why} host=${c.host}${displayIdentity(c.sessionName, c.session) ? ` session=${displayIdentity(c.sessionName, c.session)}` : ''}`);
+    }
     if (!opts.prune) print('  (worktree-less claims are not auto-removed — re-run with --prune to remove)');
   }
   if (report.orphanPorts.length) {
@@ -2428,7 +2489,8 @@ function cmdDoctor(argv) {
     for (const r of report.brokenRecords) {
       print(`  ${r.kind} ${r.name} [${r.repo}]`);
       for (const p of r.problems) print(`      ${p}`);
-      if (r.repaired) print(`      → repaired from disk: branch ${r.repaired.branch} · path ${r.repaired.path}`);
+      if (r.repaired && r.repaired.deleted) print('      → deleted: zero-claim stub removed');
+      else if (r.repaired) print(`      → repaired from disk: branch ${r.repaired.branch} · path ${r.repaired.path}`);
     }
     if (report.brokenRecords.some((r) => !r.repaired)) {
       print('  These fail SILENTLY elsewhere: `landed` cannot classify the worktree, and `ship`');

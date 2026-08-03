@@ -563,6 +563,17 @@ Three changes, one per failure:
   its path and its checked-out branch, and the claims hanging off it); a branch nothing can see is
   never guessed.
 
+A `pending` stub (see above — a claim stub with `path: null`, written by `colab claim --worktree`
+for a worktree that does not exist yet) can itself end up unreachable, a mirror-image failure of the
+same shape (#110): the claim that pointed at it gets repointed elsewhere (`colab worktree new`
+derives its own key rather than reading the claim's), or the claim aborts before `worktree new` ever
+runs. Either way the stub has no directory, no ports, no branch, and now no claim either — and its
+only documented purpose was shielding a claim from the orphan pass, so once no claim points at it
+that purpose is spent. `doctor` treats **zero claims referencing the stub** as proof, not a
+probability: it is reported (and, under `--prune`, deleted outright) with **no TTL**, unlike the
+sibling case just below of a stub a claim still holds, which stays age-gated (it may be mid-flight,
+between `claim` and `worktree new`).
+
 Repair by hand goes **through the CLI**, never by editing `state.json` — several sessions write to
 it concurrently, so a read-modify-write there can lose another session's update:
 
@@ -667,7 +678,7 @@ Run `colab <cmd> --help` for full detail.
 | `worktrees [--json]` | list worktrees (status + on-disk liveness); also reports directories git never linked at all (no `.git`) but that look worktree-shaped (`CLAUDE.md` + `.github/project.yml`) — reports only, never prunes (#99) |
 | `ship [--worktree N \| --branch B] [--message M] [--keep-worktree] [--delete-branch] [--dry]` | `code-ship`: squash-merge a session branch → trunk. The branch is **kept** unless `--delete-branch`. Gated by repo autonomy (see *Phase B autonomy ladder*) |
 | `promote [--repo P] [--message M] [--dry]` | **promotion** trunk → main (`--no-ff`). Gated by `deploy` + `promotion`; never tags/deploys directly (see *Promotion*) |
-| `doctor [--prune] [--ttl H] [--json]` | heal dead worktrees / orphan + stale claims / orphan ports; report records whose branch or path cannot be resolved (see *Records that cannot be acted on*); flip + sweep **merged** worktrees (see *Worktree lifecycle*); **list** shipped branches awaiting deletion (never deletes them) |
+| `doctor [--prune] [--ttl H] [--json] [--sync]` | heal dead worktrees / orphan + stale claims / orphan ports; report records whose branch or path cannot be resolved, including a zero-claim `pending` stub (no TTL — see *Records that cannot be acted on*); flip + sweep **merged** worktrees (see *Worktree lifecycle*); **list** shipped branches awaiting deletion (never deletes them); `--sync` also flags a worktree-less claim the tracker no longer shows assigned+in-progress (no TTL either) and spent `group:<key>` labels |
 | `release-notes [<range>] [--repo P] [--out F] [--headline "..."]` | grouped Markdown release summary from git history (see below) |
 | `template [<name>] [--dest F] [--repo P] [--force]` | copy a handbook workflow template into a repo, **stamped** with the handbook version (see below) |
 | `update [<repo>...] [--apply] [--json] [--quiet]` | sweep the fleet registry for stamped copies that fell behind a changed template; `--apply` refreshes the **pristine** ones. Never commits; never touches a hand-edited copy (see below) |
@@ -1105,6 +1116,12 @@ either with a bare `git push` — the guard blocks trunk and main.
   merged` flips and merged-worktree sweep candidates).
 - Worktree-less ("trunk") claims are never auto-removed; `doctor` only *flags* stale ones. You
   remove them with `--prune`. This is deliberate — a trunk claim may be a long-running deliberate one.
+- Under `--sync`, `doctor` also flags (and, with `--prune`, removes) a worktree-less claim whose
+  issue the tracker no longer shows assigned + `in-progress` — regardless of age (#111). This is the
+  same predicate `claims --sync --prune` already applies by hand, reusing `git.ghAssignedIssues` the
+  same way and computed **before** any lock is taken (network work never happens while `state.json`
+  is held open). A repo `gh` can't reach is skipped for this check, exactly like `claims --sync`:
+  never read as "nothing assigned", which would reap every claim on the machine.
 - `doctor --prune` sweeps only **merged** worktrees, and only when their tracked tree is clean;
   `running` worktrees (and any worktree with a live claim) are never swept. The sweep is local-only —
   `doctor` never touches GitHub.
