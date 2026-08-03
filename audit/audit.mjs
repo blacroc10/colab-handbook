@@ -523,7 +523,21 @@ function makeSource(target) {
       branches: () => {
         try {
           const out = execFileSync("git", ["-C", root, "for-each-ref", "--format=%(refname:short)", "refs/heads"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-          return out.split("\n").map((s) => s.trim()).filter(Boolean);
+          const list = out.split("\n").map((s) => s.trim()).filter(Boolean);
+          // Zero local branch refs plus a detached HEAD is what a shallow `pull_request`
+          // checkout looks like (actions/checkout defaults to fetch-depth 1 and checks out
+          // the merge commit detached, with no refs/heads at all) — not the same claim as
+          // "this repo genuinely has no branches". Report it the same way as "not a git
+          // checkout": unverifiable, not a trunk-missing finding (#104).
+          if (list.length === 0) {
+            try {
+              const head = execFileSync("git", ["-C", root, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+              if (head === "HEAD") return null;
+            } catch {
+              // rev-parse itself failed — fall through and report the (empty) list as-is.
+            }
+          }
+          return list;
         } catch {
           return null; // not a git repo, or git unavailable
         }
