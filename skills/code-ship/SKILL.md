@@ -535,6 +535,18 @@ colab worktree rm <name>    # if colab is installed (releases its claims, frees 
 git worktree remove <path>  # … else raw git
 ```
 
+**The raw fallback is not equivalent — it only deletes the directory.** `colab
+worktree rm` does four things: removes the directory, drops the worktree record from
+`state.json`, frees the ports the record owned, and releases the issue claim(s) it
+carried. Raw `git worktree remove` does the first and nothing else — the record
+survives with `status: "running"`, still holding its ports, and any tool reading
+`colab worktrees` reports it as live work in progress long after the checkout is
+gone. Taking this path (no `colab` on this machine) means finishing the other three
+by hand, on the machine that holds `state.json`: release each claim
+(`gh issue edit <N> --remove-label in-progress`) and have that machine prune the
+stale record — `colab` has no unattended flag for this, so say so in your report
+rather than leaving it silently wrong.
+
 `colab worktree rm` runs the repo's `.colab/hooks/pre-remove` (e.g. dropping a
 cloned DB) and refuses if there's uncommitted work — tracked changes **or**
 untracked, non-ignored files. Untracked counts because it is the only category

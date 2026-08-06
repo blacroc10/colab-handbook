@@ -273,7 +273,14 @@ Read the verdict `colab worktrees` already computed (§1.2) and act by hand:
 - **`landed vs <trunk>`** → the content shipped by some other route (a prior session's
   interrupted wrap, or a #62-style husk). Confirm with `colab landed --repo <repo> --branch
   <branch>`, then `git worktree remove <path>` (`--force` if git objects, not tracked files,
-  uncommitted) and `git branch -D <branch>`. No claim to release, no ports to free.
+  uncommitted) and `git branch -D <branch>`. This is *not* the same raw-fallback gap as
+  `code-ship`'s B4: `unrecorded` means colab never held a `state.json` entry for this
+  worktree at all, so there is no registry record for the raw command to strand — that is
+  what "no claim to release, no ports to free" means here. It does **not** mean the
+  branch's issue(s) are clean: a claim can have been set by hand (`gh issue edit … --add-label
+  in-progress`) outside colab's tracking entirely. Check the branch's issue number(s) for
+  a stale `in-progress` label and release it (`gh issue edit <N> --remove-label
+  in-progress`) before you move on — nothing else here will.
 - **`cargo` / `unknown vs <trunk>`** → genuine unmerged content with no claim behind it. Do
   **not** guess ownership from the branch name alone. Check whether the branch's issue numbers
   belong to *this* repo's tracker (`gh issue view <N>` — 404 or a title that makes no sense means
