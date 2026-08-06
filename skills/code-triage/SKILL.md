@@ -213,7 +213,33 @@ single-issue mode below is the same shape), and apply the coverage rule:
 ### 0.2 Running this twice must change nothing
 
 Under ping-when-idle a re-run is the normal case, not the exception, so every write this
-skill performs has to be idempotent:
+skill performs has to be idempotent.
+
+**This skill's tracker writes are exhaustive — the list below is all of them, and nothing
+else is authorised.** An enumeration of "which writes must be careful" reads, by omission,
+as permission for anything unlisted; it is not. If a write is not one of the five below, it
+is not a triage write, no matter how naturally it seems to belong on the issue:
+
+1. `blocked_by` dependency edges (§4)
+2. the `deps-checked` label, via `colab readiness` (single-issue mode, §4; whole-repo path, §6)
+3. the `group:<key>` label plus its one evidence comment (§3)
+4. the `needs-plan` label plus its one reason comment (§6)
+5. the `mechanical-lane` label plus its one reason comment (§6)
+
+**§6's report is console output.** It is what the human or session reading this triage
+directly sees; it is never posted to the issue tracker as a comment, in whole or in part —
+not the ranked list, not a single group's verdict, not a restatement of "still ready,
+unchanged." Measured: one issue collected nine near-identical narrative verdict comments in
+under four hours from a ping-when-idle loop inventing exactly this unauthorised sixth write,
+burying the one human ruling that actually mattered on that issue under six copies of a
+machine re-confirming what it had already confirmed. If a durable per-issue verdict is
+genuinely wanted, that is a new write needing its own idempotence rule — proposing one is
+out of scope for a triage pass to decide unilaterally by posting.
+
+**Publish only when the verdict changed, not on every re-measurement.** §0 re-running a full
+pass is not license to re-post writes 3-5 above if their conclusion did not move — each
+already carries its own grep-before-post check below; run that check before every post, not
+only the first one, and when nothing changed, post nothing.
 
 - **Dependency edges: read before writing.** `gh issue view <N> --json blockedBy` and skip
   the POST if the edge is already there. §4 writes edges; a second triage reaching the same
@@ -557,6 +583,13 @@ with the blocker named:
       `git branch -a --list '*<n>*'` after `git fetch --prune`. A clean label does
       not prove clean ground: claims are released unconditionally at wrap, so an
       abandoned branch can exist with no claim on it at all.
+      **Scope the check to this group's own deliverable paths.** `colab worktrees`
+      lists every live worktree in the repo, most of them on files this group never
+      touches; a repo-wide list is not evidence of contention unless it intersects
+      the paths this group would actually edit. An empty intersection is not a
+      finding — do not narrate it in the report, and do not let it vary the
+      per-beat verdict when the only thing that moved was an unrelated worktree.
+      Report contention only when there is a real path overlap, and name it.
 - [ ] **No pending design ruling** — no `needs-ruling` label (`CONVENTIONS.md` §5,
       *Design ruling*). A design surface awaiting human pre-approval is not a start
       candidate for anyone, manual or scheduled, until a human clears the label —
@@ -620,6 +653,14 @@ unmerged)` · `free (checked)` · `dependencies unchecked`. Collapsing any of th
 another is how a group gets started into a wall, or left in a queue it could have left.
 
 ## 6. Report — make it directly actionable
+
+**This report is console output, not a tracker write.** Print it to whoever is reading this
+session; never post it, or any per-beat summary of it, as an issue comment. §0.2 names the
+five writes this skill is authorised to make — a narrative verdict is not one of them, even
+when the verdict is genuinely new information. If a group's verdict changed in a way worth
+recording durably, that lands through one of the five named writes (the label, the evidence
+comment, the plan/lane reason), never through a fresh prose comment invented for the
+occasion.
 
 For each **ready** group, give the four things a session needs to begin:
 
@@ -801,6 +842,11 @@ Hand the top group to **code-start**, which will re-verify the claim before taki
 
 ## Verify complete
 
+- **No write outside §0.2's five landed on the tracker.** In particular: no per-beat
+  narrative verdict comment, no restated §6 report, no "still ready, unchanged" note — the
+  report went to the console and nowhere else. A group's file-contention line, if reported
+  at all, named an actual path overlap with this group's own deliverables, not the
+  repo-wide worktree list.
 - A run that short-circuited said so, named the timestamp it compared against, and
   re-printed a stored conclusion whose scope covers what was asked.
 - A run that proceeded wrote its fingerprint **and** its conclusion to `$CACHE`, so the
