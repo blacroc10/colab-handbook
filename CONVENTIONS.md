@@ -152,14 +152,12 @@ which branch that is in a given repo. Never create a branch literally named `tru
 
 That includes never *recording* one. The word is a natural placeholder for "no branch — this
 work sits on the trunk checkout", and written into a field that names a branch it becomes a
-name nothing can resolve. We had one: a session's record read `branch: "trunk"` while the real
-branch was healthy, and the damage was invisible because each reader failed politely. The
-lifecycle check answered `unknown`; the merge tool matched claims **by branch name**, found
-none, reported `(none claimed)` and squashed anyway — so the commit carried **no `Closes #N`**
-and the issue stayed open with its code merged, which is the 26-of-30 failure above, reached
-by a path nothing was watching. **The absence of a branch is null, not a word.** A tool that
-stores this should refuse the role word on write, and should treat "this branch has no claimed
-issues" as suspicious rather than routine.
+name nothing can resolve. Measured: a session's record read `branch: "trunk"` while the real
+branch was healthy; the merge tool matched claims **by branch name**, found none, and squashed
+anyway — no `Closes #N`, the same 26-of-30 failure above reached by a different path.
+**The absence of a branch is null, not a word.** A tool that stores this should refuse the role
+word on write, and should treat "this branch has no claimed issues" as suspicious rather than
+routine.
 
 **Trunk is the primary integration point, and not always the only one.** A repo may declare
 additional long-lived lines in `project.yml`
@@ -425,13 +423,9 @@ before you wrap.
 worktree session.** `refs/stash` is a single ref per repository; plain git has no way to give
 each worktree its own. Two concurrent worktree sessions on the same repo, both stashing around
 the same time, can push and pop over each other with no error and no conflict marker. Measured:
-on a repo running 10+ concurrent worktree sessions, one session's `git stash pop` — done to
-check whether a test failure was pre-existing — restored a *different* session's uncommitted
-changes into its own working tree. Nothing signalled a problem; only the second session
-noticing its work had vanished caught it, and a re-stash from a third, unrelated, much older
-session was already sitting in the same shared stack the entire time. Had either session
-reflexively discarded what looked like "unexpected local changes" instead of recognising the
-mismatch, the swap would have destroyed the other session's work outright — worse than a merge
+on a repo running 10+ concurrent worktree sessions, one session's `git stash pop` restored a
+*different* session's uncommitted changes into its own working tree, with a third, unrelated,
+much older stash already sitting in the same shared stack the whole time — worse than a merge
 conflict, because nothing ever signals that anything went wrong.
 
 Prefer, in order: `git diff` / `git status` to read what changed without moving it; targeted
@@ -710,12 +704,9 @@ it knows the answer, and only at filing time.
 
 `agent-filed` says *a human did not decide this work should exist*; it does not say what
 kind of decision the issue is waiting on. Measured on a live 34-item approve queue
-(2026-08-01): the queue decomposed into six ask-classes with different verbs — a
-permission to touch prod state, a design or process ruling, a bug someone needs to accept,
-a work proposal, a self-deferred item waiting on a trigger, an epic — but a reader detected
-the lane heuristically, from labels and title phrasing ("needs an explicit OK", "needs an
-operator decision", "blocked until <trigger>"). The filer *knows* the class the moment it
-writes the issue; nothing downstream should have to guess it back out of prose.
+(2026-08-01): six ask-classes with different verbs, detected only heuristically, from labels
+and title phrasing. The filer *knows* the class the moment it writes the issue; nothing
+downstream should have to guess it back out of prose.
 
 **So an `agent-filed` issue ends its body with one more machine-readable line, next to
 `Filed-by:`:**
@@ -1211,13 +1202,12 @@ files, so they must move on one branch.** Two sessions editing the same files me
 each other. The group is the prevention, not a tidiness preference.
 
 Triage already computes it — it has to, in order to emit a branch name and a claim
-command. A real run in this repo concluded that two issues MUST share a branch because
-both rewrite `skills/code-sweep/SKILL.md:3`, named the line and the consequence, printed
-it, and ended. Nothing outside that terminal could read it, and the next run re-derived it
-from scratch — or did not. That is the failure *Readiness* already named, one relationship
-later: *prose does not block a parallel session, and no tool can read it.* The cost is
-exact — a second session can claim one member without ever learning the other exists,
-which is precisely the collision the grouping was computed to prevent.
+command. Measured: a real triage run concluded two issues MUST share a branch, printed
+the `file:line` collision, and ended — nothing outside that terminal could read it. That
+is the failure *Readiness* already named, one relationship later: *prose does not block a
+parallel session, and no tool can read it.* The cost is exact — a second session can claim
+one member without ever learning the other exists, which is precisely the collision the
+grouping was computed to prevent.
 
 **Neither existing mechanism can carry it, because the shape is wrong:**
 
@@ -1317,12 +1307,10 @@ go-ahead, scoped to that repo**, even when the session is confident it found the
 fix. The correct move is to report the finding — an Issue there, or a comment pointing
 at the existing branch — and stop.
 
-Measured: a session working a downstream repo's issue correctly traced the root cause
-to an existing branch in the upstream tool repo the issue pointed at, then — with no
-claim there and no go-ahead scoped to it — rebased that branch (which had drifted
-materially behind trunk) and force-pushed the result. It was caught and reverted before
-anything merged, so no lasting damage landed; the sequence of actions is what this rule
-exists to prevent, not the eventual outcome.
+Measured: a session traced a downstream issue to an existing branch in an upstream tool
+repo, then — with no claim and no go-ahead scoped to that repo — rebased and force-pushed
+it. Caught and reverted before merging; the sequence is what this rule exists to prevent,
+not the eventual outcome.
 
 #### Epics — a container is not a start candidate
 
@@ -1727,12 +1715,10 @@ resolve.
 
 A trap worth naming: **`requirements.txt` does not declare an interpreter.** It pins
 dependencies only, so a Python repo carrying just that file has declared no version at all
-and must add `python:` to `project.yml` or a `.python-version`. We learned this the
-expensive way — a Python repo adopted the handbook, found no Python template, copied the
-**Node** one and grafted a Python job into it with `python-version: "3.13"` hardcoded. The
-repo did the reasonable thing with what existed; the rule was right and there was simply
-nowhere to declare the value. **A missing template is not a neutral absence** — it does not
-stop adoption, it redirects it into a worse form, and leaves behind a file whose header
+and must add `python:` to `project.yml` or a `.python-version`. Measured: a Python repo
+adopted the handbook, found no Python template, and copied the **Node** one with
+`python-version: "3.13"` hardcoded into it. **A missing template is not a neutral
+absence** — it redirects adoption into a worse form and leaves behind a file whose header
 lies about what it is.
 
 ### Test fixtures — neutralise ambient machine state, don't inherit it
@@ -1746,13 +1732,13 @@ project. On a clean CI runner this is invisible (no global hooks path there), wh
 what makes it a trap: the failure is developer-local and shows up as tests going red for reasons
 that have nothing to do with the change someone is testing.
 
-This has now happened twice, in the identical shape — a fixture copied from a sibling test file
-with one guard dropped: ambient `gh` credentials the first time, ambient `core.hooksPath` the
-second (`tools/lib/orphan-worktree.test.js`, fixed alongside a grep-based regression check in
-`tools/lib/fixture-hooks-lint.test.js` so the next copy cannot drop the line silently). The pattern,
-not just either instance, is the rule: a git fixture helper sets `user.email`, `user.name`, **and**
-`core.hooksPath` (pointed at a nonexistent directory, e.g. `path.join(dir, '.nohooks')`) before it
-ever commits.
+Measured: this has happened twice, in the identical shape — a fixture copied from a sibling
+test file with one guard dropped, ambient `gh` credentials the first time and
+`core.hooksPath` the second (`tools/lib/orphan-worktree.test.js`, fixed alongside a
+regression check in `tools/lib/fixture-hooks-lint.test.js`). The pattern, not just either
+instance, is the rule: a git fixture helper sets `user.email`, `user.name`, **and**
+`core.hooksPath` (pointed at a nonexistent directory, e.g. `path.join(dir, '.nohooks')`)
+before it ever commits.
 
 ---
 
