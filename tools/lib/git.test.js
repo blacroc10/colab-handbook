@@ -237,6 +237,27 @@ test('a stale run on an OLD sha does not count as green for the current head', (
   assert.deepStrictEqual(result, { status: 'none', conclusion: null, sha: fx.sha });
 });
 
+test('a failed sibling of a passing run on the SAME sha reads red, not green (#146/#162)', () => {
+  const fx = fixture();
+  // Two workflows on one push: the cheap one passed, the test suite failed. `find` used to
+  // short-circuit on the first success in the array and never look at the failure sitting right
+  // next to it — any-green where the gate's contract requires all-green.
+  const result = fx.withFakeGh([
+    { headSha: fx.sha, status: 'completed', conclusion: 'success' },
+    { headSha: fx.sha, status: 'completed', conclusion: 'failure' },
+  ], () => git.ghRunForSha(fx.work, 'main'));
+  assert.deepStrictEqual(result, { status: 'completed', conclusion: 'failure', sha: fx.sha });
+});
+
+test('a failed sibling wins regardless of array order — success listed first still reads red', () => {
+  const fx = fixture();
+  const result = fx.withFakeGh([
+    { headSha: fx.sha, status: 'completed', conclusion: 'failure' },
+    { headSha: fx.sha, status: 'completed', conclusion: 'success' },
+  ], () => git.ghRunForSha(fx.work, 'main'));
+  assert.deepStrictEqual(result, { status: 'completed', conclusion: 'failure', sha: fx.sha });
+});
+
 test('the sha has runs but none succeeded — surfaces the most informative one, not a false none', () => {
   const fx = fixture();
   const result = fx.withFakeGh([

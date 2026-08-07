@@ -295,7 +295,10 @@ function ghLabelDelete(repo, name) {
  *   - the branch does not exist on origin, or `git`/`gh` failed → null
  *
  * A cancelled sibling of a passing run on the SAME sha is not evidence of anything — it is simply
- * not read, because the passing run for that sha is what answers the question.
+ * not read, because the passing run for that sha is what answers the question. A *failed* sibling
+ * is a different matter: `forSha` holds one row per workflow, and green requires ALL of them to
+ * have succeeded, not merely one (#146/#162) — a completed failure on the sha always wins over a
+ * completed success sitting next to it, checked first, before any success short-circuits the read.
  */
 function ghRunForSha(repo, branch, limit = 10) {
   const head = run('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd: repo });
@@ -312,12 +315,18 @@ function ghRunForSha(repo, branch, limit = 10) {
   const forSha = runs.filter((x) => x && x.headSha === sha);
   if (forSha.length === 0) return { status: 'none', conclusion: null, sha };
 
+  // A completed failure anywhere in the sibling set makes the sha not-green, regardless of any
+  // sibling that succeeded — checked BEFORE the success check below, so a failing workflow is
+  // never masked by a passing one on the same sha.
+  const failed = forSha.find((x) => x.status === 'completed' && x.conclusion === 'failure');
+  if (failed) return { status: 'completed', conclusion: 'failure', sha };
+
   const success = forSha.find((x) => x.status === 'completed' && x.conclusion === 'success');
   if (success) return { status: 'completed', conclusion: 'success', sha };
 
-  // None succeeded for this sha — report the most informative row: a run still in flight (it may
-  // yet succeed) over a finished-but-not-successful one (gh returns newest-first; forSha[0] is the
-  // newest of the non-successes either way).
+  // None succeeded and none failed for this sha — report the most informative row: a run still in
+  // flight (it may yet succeed) over a finished-but-not-successful one (gh returns newest-first;
+  // forSha[0] is the newest of the non-successes either way).
   const pending = forSha.find((x) => x.status !== 'completed');
   const pick = pending || forSha[0];
   return { status: pick.status, conclusion: pick.conclusion || null, sha };
