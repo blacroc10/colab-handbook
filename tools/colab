@@ -5563,6 +5563,34 @@ function cmdShip(argv) {
     warn(`#${cf.num}: the branch commit said "${cf.from} #${cf.num}" but this ship closes it (${cf.to} #${cf.num}) — inherited trailer dropped, kept ship's own.`);
   }
 
+  // #119: re-read the FINAL message — exactly what is about to be committed, including any
+  // --message override and the CI-Grant trailer appended above — and assert it actually closes
+  // everything ship resolved to close. See lib/shipguard.js's closesCoverage doc for why `missing`
+  // is a hard gate (ship's own resolved intent contradicting its own commit text) while `dropped`
+  // and `stray` are advisory (inferred from prose, not authoritative enough to block).
+  const coverage = shipguard.closesCoverage({ message: commitMsg, closeIssues, refsIssues, commits: shipCommits });
+  if (!coverage.ok) {
+    cleanupEphemeral(); cleanupTarget();
+    process.stderr.write(
+      `✗ B1: the final squash message carries no \`Closes\` line for ${coverage.missing.map((n) => '#' + n).join(', ')} — ` +
+      'the merge would land and ' + (coverage.missing.length > 1 ? 'those issues would' : 'that issue would') +
+      ' stay OPEN with its work already shipped. Nothing pushed.\n' +
+      `  Add to the message and re-run:   ${coverage.missing.map((n) => `Closes #${n}`).join(', ')}\n` +
+      `  (or \`colab ship … --refs ${coverage.missing.join(',')}\` if this ship does not complete ${coverage.missing.length > 1 ? 'them' : 'it'})\n`);
+    return 1;
+  }
+  for (const d of coverage.dropped) {
+    warn(`#${d}: the branch's commits say they close it, but this ship is not carrying it — the squash message`);
+    warn(`  will NOT close it, so it stays open with its code merged. Claim it, or reword that commit to \`Refs #${d}\`.`);
+  }
+  for (const s of coverage.stray) {
+    if (s.reason === 'refs') {
+      warn(`#${s.issue}: kept open on purpose (--refs), but the squash message also closes it — GitHub will close it on merge anyway.`);
+    } else {
+      warn(`#${s.issue}: the squash message closes it but this ship is not carrying it — GitHub will close it on merge.`);
+    }
+  }
+
   print(`B1: squash-merging ${sess.branch} → ${target} …`);
   const sq = git.git(['merge', '--squash', sess.branch], targetDir);
   if (!sq.ok) {
