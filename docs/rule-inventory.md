@@ -28,13 +28,14 @@ as an unticked row later — it just quietly stops existing.
   `^-? ?\*\*[^*]{3,150}\*\*`), then the whole 2,055+532 lines were read straight
   through to catch rules stated in plain prose or only implied by an example —
   the issue's own sizing note said to expect exactly that.
-- 233 rows below is a **floor, not a target** — consistent with the issue's own
-  "expect roughly 178 rows... floor not target" against the pre-trim document;
-  the trimmed document still yields more rows than that floor because each
-  `####` gotcha subsection (Migration exemption, Red-trunk exemption, Scheduled
-  drivers, Grouping, Delivery type, etc.) turned out to carry 8-15 distinct
-  obligations once read line by line, not the 1-2 a bold-lead scan alone would
-  suggest.
+- **178 rows was the floor; 430 is the result** — consistent with the issue's
+  own "expect roughly 178 rows... floor not target" against the pre-trim
+  document. The trimmed document still yields far more rows than that floor
+  because each `####` gotcha subsection (Migration exemption, Red-trunk
+  exemption, Scheduled drivers, Grouping, Delivery type, etc.) turned out to
+  carry 8-15 distinct obligations once read line by line, not the 1-2 a
+  bold-lead scan alone would suggest — the gap between 178 and 430 is itself
+  the finding about where rules hide.
 
 ---
 
@@ -681,19 +682,22 @@ with the row(s) they illustrate:
 
 ---
 
-## Findings (contradiction / supersession / reality drift / no-measured-claim) — reported, not fixed
+## Findings (contradiction / supersession / consolidation risk / reality drift / no-measured-claim) — reported, not fixed
 
 Per the issue's instruction, these are surfaced as findings only; **no edits were made
 to `CONVENTIONS.md` or `project.schema.md`.**
 
-### Reality drift
+### Consolidation risk
 
 - **F1 — Row 335 vs. the doc's own worked history.** §9 step 9 ("Do not create `dev`
   unless the repo is genuinely Tier A or Tier C") and Anti-pattern 1 (`CONVENTIONS.md:1981-1985`)
-  describe the identical failure mode from two different angles — not a contradiction, but
-  worth flagging because a rewrite could accidentally fold them into one paragraph and lose
-  the concrete "76 commits stale" measurement that makes the anti-pattern version more
-  persuasive than the rule version.
+  describe the identical failure mode from two different angles — not drift (both passages
+  are accurate today) and not a contradiction, but worth flagging because a rewrite could
+  accidentally fold them into one paragraph and lose the concrete "76 commits stale"
+  measurement that makes the anti-pattern version more persuasive than the rule version.
+
+### Reality drift
+
 - **F2 — "twelve" labels vs. the actual count of `gh label create` lines.** `CONVENTIONS.md:1841`
   says *"All twelve are required"* immediately before a block (`CONVENTIONS.md:1846-1857`)
   that contains **fourteen** `gh label create` lines (`in-progress`, `deps-checked`,
