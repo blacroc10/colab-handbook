@@ -59,8 +59,36 @@ jobs:
         run: node scripts/check-text-bytes.mjs
       # The stamp heuristic decides whether a repo's file is "ours". A false positive there ends in
       # advice to overwrite that file, so it is the one piece of logic here with unit tests.
+      #
+      # This step is fail-open by default: if NODE_TEST_CONTEXT/NODE_TEST_WORKER_ID leak in from a
+      # parent process, `node --test` decides it is already running as a child test run, skips
+      # everything, and still exits 0 (#154). A hosted runner starts clean so that specific cause is
+      # not believed to hit here today, but the check below is not about that one cause — it also
+      # catches a glob matching zero files after a rename, or a runner image change, the same way.
+      # `-u` on unset vars is a harmless no-op, so scrubbing is safe even when nothing leaked.
+      #
+      # `set -o pipefail` is NOT implied here. This repo declares no `shell:`, so a Linux `run:`
+      # block is invoked as `bash -e {0}` — `-e` only, no `-o pipefail` (that combination is only
+      # what `shell: bash` gets). Piping `node --test | tee …` without it made `tee`'s always-0 exit
+      # the step's exit, silently turning a genuine failing test into a passing step — a wider
+      # fail-open than the one this change closes. Measured: a deliberately failing test under
+      # `bash -e {0}` exactly as the runner invokes it exits 0 without the line below, 1 with it.
       - name: Unit tests
-        run: node --test tools/lib/*.test.js
+        run: |
+          set -o pipefail
+          env -u NODE_TEST_CONTEXT -u NODE_TEST_WORKER_ID \
+            node --test --test-reporter=tap tools/lib/*.test.js | tee /tmp/unit-tests.tap
+          ran="$(grep -oE '^# tests [0-9]+' /tmp/unit-tests.tap | grep -oE '[0-9]+' || true)"
+          failed="$(grep -oE '^# fail [0-9]+' /tmp/unit-tests.tap | grep -oE '[0-9]+' || true)"
+          if [ -z "$ran" ] || [ "$ran" -eq 0 ]; then
+            echo "::error::node --test reported zero tests run — this step is supposed to fail closed, not silently pass (see #154)" >&2
+            exit 1
+          fi
+          if [ -z "$failed" ] || [ "$failed" -ne 0 ]; then
+            echo "::error::node --test reported $failed failing test(s) — pipefail should already have failed this step; this is belt-and-suspenders (see #154)" >&2
+            exit 1
+          fi
+          echo "Ran $ran test(s), 0 failed."
 
       - name: Audit the handbook against its own conventions
         run: node audit/audit.mjs --local .
