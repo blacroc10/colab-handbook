@@ -102,6 +102,32 @@ function branchExists(repo, branch) {
   return false;
 }
 
+/**
+ * Authoritative "does this branch name already resolve to a ref" check — for the one caller
+ * (`worktree new`, #124) that must refuse rather than silently cut a fresh branch over an
+ * existing one's history.
+ *
+ * `branchExists` above is not enough here: it trusts the LOCAL remote-tracking ref, and the
+ * `git fetch origin <base>` `worktree new` runs beforehand only refreshes `base` — never an
+ * arbitrary branch name — so a branch pushed from another machine (or by a session whose
+ * worktree was already torn down) can be invisible to it. `ls-remote` asks origin directly, no
+ * local cache involved, so it is fresh regardless of what has or hasn't been fetched.
+ *
+ * Local wins when both exist (it is the one a `git worktree add -b` would actually collide
+ * with). Returns `{ ref, sha }` (sha short, 7 chars) or `null` when neither resolves.
+ */
+function existingBranchRef(repo, branch) {
+  if (!branch || typeof branch !== 'string') return null;
+  const local = git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], repo);
+  if (local.ok && local.stdout) return { ref: `refs/heads/${branch}`, sha: local.stdout.slice(0, 7) };
+  const remote = git(['ls-remote', '--exit-code', 'origin', `refs/heads/${branch}`], repo);
+  if (remote.ok && remote.stdout) {
+    const sha = remote.stdout.split(/\s+/)[0] || '';
+    return { ref: `refs/remotes/origin/${branch}`, sha: sha.slice(0, 7) };
+  }
+  return null;
+}
+
 /** List worktree paths registered in a repo (porcelain). */
 function worktreeList(repo) {
   const r = git(['worktree', 'list', '--porcelain'], repo);
@@ -345,7 +371,7 @@ function ghAssignedIssues(repo) {
 }
 
 module.exports = {
-  run, git, repoRoot, mainRepoRoot, originUrl, detectTrunk, branchExists,
+  run, git, repoRoot, mainRepoRoot, originUrl, detectTrunk, branchExists, existingBranchRef,
   worktreeList, worktreeListDetailed, dirtyTracked, dirtyUntracked, dirtyAny,
   ghAvailable, ghIssueEdit, ghListLabels, ghAssignedIssues,
   ghCurrentLogin, ghIssueView, ghIssueComment, ghRunForSha,

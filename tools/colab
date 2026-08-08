@@ -1768,6 +1768,12 @@ dependency symlinking, dev-server restarts) live in OPTIONAL repo hooks, not her
       worktree, or on GitHub by someone else) the command REFUSES before building anything,
       unless --force. On success each issue gets a "🔒 Claimed" comment + the tie-break runs;
       if an issue is lost to a simultaneous racer it is yielded and the worktree is kept for reuse.
+      <branch> ALREADY EXISTING (locally or on origin) is ALSO a REFUSAL, not silent adoption,
+      and NOT overridable by --force (#124): \`worktree add -b\` would otherwise re-point that name
+      at base, discarding whatever history it already carries, with only a parenthetical in the
+      success line as the sole trace. Checked authoritatively against origin (ls-remote, not the
+      local tracking cache). Resume the existing branch by hand instead, or delete the ref first
+      if it is genuinely stale.
       Branch naming is YOUR choice; the group convention is <type>/<slug>-N-M-K, e.g.
         colab worktree new fix/import-fixes-115-114-113 --issues 115,114,113 --ports 1
 
@@ -1780,15 +1786,17 @@ dependency symlinking, dev-server restarts) live in OPTIONAL repo hooks, not her
       and state record in place for a retry, unless --force. Refuses if there are
       uncommitted TRACKED changes unless --force.
 
-  colab worktree tag <name> --session <url> [--session-name <s>]
-      REPAIR session identity on a worktree that already exists — and on every claim
-      attached to it (claims hold their own copy, and claims are what \`doctor\` reports).
-      Pass either field or both; only what you pass is overwritten. No env fallback here:
-      a repair writes exactly what you type. Existing GitHub claim comments are left as
-      posted (they are dated history, not current state).
+  colab worktree tag <name> --session <url> [--session-name <s>] [--branch <b>]
+      REPAIR session identity, and/or the recorded branch, on a worktree that already
+      exists — and on every claim attached to it (claims hold their own copy of each
+      field, and claims are what \`doctor\` reports and what \`ship\` unions by). Pass any
+      subset; only what you pass is overwritten. No env fallback and no existence check
+      on --branch: a repair writes exactly what you type, nothing inferred.
       Why it exists: \`sessionName\` is display text, \`session\` is the ONLY join key — a
       worktree with a name and no URL reads as owned and links to nothing. Identity is
-      never inferred from the name; absent stays "unknown".
+      never inferred from the name; absent stays "unknown". \`--branch\` exists because
+      \`ship\` reads the WORKTREE record's branch field, and no other command could repair
+      it (#148) — \`claim --branch\` only touches the CLAIM record.
 
   colab worktrees [--json]     list worktrees with their claims and ports
       Also reconciles against \`git worktree list\` for every repo colab has a record in (plus the
@@ -1975,6 +1983,26 @@ function cmdWorktreeNew(argv) {
 
   const wtPath = path.join(repoAbs, worktreeSubdir(config), name);
   if (fs.existsSync(wtPath)) throw new UserError(`Worktree path already exists: ${wtPath}`);
+
+  // ---- REFUSAL: don't cut a fresh branch over one that already has history (#124) ----
+  // `git worktree add -b <branch> origin/<base>` below would happily re-point an EXISTING
+  // branch name at base, discarding whatever commits it already carries — the only signal
+  // being a parenthetical "(base origin/main @ sha)" in the success output that reads as
+  // routine provenance, not a warning. Checked authoritatively (ls-remote, not the local
+  // remote-tracking cache) because the fetch above only refreshes `base`, never this name.
+  // Deliberately NOT overridable by --force: --force there means "take over an issue claim",
+  // and git itself refuses `worktree add -b <name>` when a LOCAL branch of that name already
+  // exists, so there is no safe "proceed anyway" to offer here without first destroying the ref
+  // — which is the operator's call, made explicitly, not a flag's.
+  const existingRef = git.existingBranchRef(repoAbs, branch);
+  if (existingRef) {
+    throw new UserError(
+      `branch "${branch}" already exists (${existingRef.ref} @ ${existingRef.sha}) — refusing to cut ` +
+      `a fresh branch over it, which would silently discard its history.\n` +
+      `  To resume that branch: git worktree add ${wtPath} ${branch}\n` +
+      `  If it is genuinely stale and you want a fresh branch of the same name: delete the ref first ` +
+      `(git branch -D ${branch} / git push origin --delete ${branch}), then re-run this command.`);
+  }
 
   // 1. fetch + create worktree
   print(`fetch origin/${base} + create worktree "${name}" (branch ${branch})`);
@@ -2199,16 +2227,27 @@ function cmdWorktreeRm(argv) {
 }
 
 /**
- * `colab worktree tag <name> --session <url> [--session-name <s>]` — repair session identity on an
- * ALREADY-created worktree. Before this, the only fix was hand-editing ~/.colab/state.json.
+ * `colab worktree tag <name> --session <url> [--session-name <s>] [--branch <b>]` — repair
+ * session identity, and/or the recorded branch, on an ALREADY-created worktree. Before this, the
+ * only fix was hand-editing ~/.colab/state.json.
  *
- * It writes BOTH records. Claims keep their own copies of `session`/`sessionName` (inherited at
- * creation), and claims are what `colab doctor` reports on — so a worktree-only repair would leave
- * doctor still printing anonymous rows and look like the fix had not worked. One command, both.
+ * `--branch` (#148) exists because `ship`'s own refusal used to prescribe a repair that didn't
+ * cure it: a worktree record whose branch resolves to no ref (a stored slug missing its `type/`
+ * prefix, e.g.) made `ship` refuse, and `colab release <N> && colab claim <N> --branch <b>
+ * --worktree <name>` — the exact command the refusal printed — only rewrites the CLAIM's branch
+ * field, never the WORKTREE's. `ship` reads `wt.branch` (via `resolveShipSession`), so the same
+ * refusal fired again, identically, with no CLI path out of it. This command is the one that
+ * actually owns that field, so it is the one that can fix it — same posture as `--session`:
+ * write exactly what was passed, infer nothing.
+ *
+ * It writes across records. Claims keep their own copies of `session`/`sessionName`/`branch`
+ * (inherited at creation), and claims are what `colab doctor` reports on and what `ship` unions
+ * claims by — so a worktree-only repair would leave doctor still printing anonymous rows, and a
+ * branch-only repair would leave claims pointing at the old name. One command, both records.
  */
 function cmdWorktreeTag(argv) {
   const opts = parseArgs(argv, {
-    values: { '--session': 'session', '--session-name': 'sessionName' },
+    values: { '--session': 'session', '--session-name': 'sessionName', '--branch': 'branch' },
     flags: { '-h': 'help', '--help': 'help' },
   });
   if (opts.help || opts._.length === 0) return print(HELP_WORKTREE);
@@ -2216,10 +2255,13 @@ function cmdWorktreeTag(argv) {
   // Deliberately NOT resolveSession()/resolveSessionName(): the env fallback belongs to CREATION.
   // A repair must write exactly what the operator passed — inheriting COLAB_SESSION_NAME from a
   // shell that never had COLAB_SESSION is how the half-identity is produced in the first place.
+  // Same reasoning extends to --branch: no inference, no existence check — the whole point is to
+  // let the operator record a branch state can't currently prove on its own.
   const session = String(opts.session || '').trim();
   const sessionName = String(opts.sessionName || '').trim();
-  if (!session && !sessionName) {
-    throw new UserError('Nothing to tag — pass --session <url> and/or --session-name <s>');
+  const branch = String(opts.branch || '').trim();
+  if (!session && !sessionName && !branch) {
+    throw new UserError('Nothing to tag — pass --session <url>, --session-name <s>, and/or --branch <b>');
   }
   if (!state.loadState().worktrees[name]) {
     throw new UserError(`No worktree "${name}" in state (list them with: colab worktrees)`);
@@ -2228,23 +2270,30 @@ function cmdWorktreeTag(argv) {
   const out = state.mutate((st) => {
     const wt = st.worktrees[name];
     if (!wt) throw new UserError(`No worktree "${name}" in state`); // lost the race with a rm
-    const before = { session: wt.session || '', sessionName: wt.sessionName || '' };
+    const before = { session: wt.session || '', sessionName: wt.sessionName || '', branch: wt.branch || '' };
     if (session) wt.session = session;
     if (sessionName) wt.sessionName = sessionName;
+    if (branch) wt.branch = branch;
     const claims = [];
     for (const c of Object.values(st.claims)) {
       if (c.worktree !== name) continue;
       if (session) c.session = session;
       if (sessionName) c.sessionName = sessionName;
+      if (branch) c.branch = branch;
       claims.push(c.issue);
     }
-    return { before, after: { session: wt.session || '', sessionName: wt.sessionName || '' }, claims };
+    return {
+      before,
+      after: { session: wt.session || '', sessionName: wt.sessionName || '', branch: wt.branch || '' },
+      claims,
+    };
   });
 
   const arrow = (b, a) => `${b || '—'} → ${a || '—'}`;
   print(`✓ Tagged worktree "${name}"`);
   print(`  session:      ${arrow(out.before.session, out.after.session)}`);
   print(`  sessionName:  ${arrow(out.before.sessionName, out.after.sessionName)}`);
+  if (branch) print(`  branch:       ${arrow(out.before.branch, out.after.branch)}`);
   print(`  claims retagged: ${out.claims.join(' ') || '— (none attached)'}`);
   // Already-posted "🔒 Claimed" comments are NOT rewritten: a comment is a dated record of what was
   // known then, and editing history to look tidy is exactly the lie this handbook warns about.
@@ -5166,7 +5215,7 @@ function cmdShip(argv) {
       process.stderr.write(`  Worktree "${sess.name}" cannot be shipped from a record nothing can act on. Repair it\n`);
       process.stderr.write('  through the CLI (never by editing ~/.colab/state.json — other sessions write to it):\n');
       process.stderr.write(`    colab doctor            # says what is broken, --prune repairs what it can prove\n`);
-      process.stderr.write(`    colab release <N> && colab claim <N> --branch <real-branch> --worktree ${sess.name}\n`);
+      process.stderr.write(`    colab worktree tag ${sess.name} --branch <real-branch>   # fixes the WORKTREE record (and its claims) ship reads\n`);
     } else {
       process.stderr.write(`  Pass a branch that exists, or fetch it first.\n`);
     }
