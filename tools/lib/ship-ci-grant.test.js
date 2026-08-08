@@ -234,6 +234,10 @@ test('ship (real path, prose table): the "trunk CI green" row prints ✗ with th
 test('regression: the JSON and prose paths still agree on the CI row (both read not-ok) on the identical fixture', () => {
   const fx = fixture(PROJECT_YML_AUTO_TRUNK);
   addCommitBranch(fx, 'feat/clean-4');
+  // Claimed (#153: an unclaimed branch whose NAME ends in an issue number now refuses before the
+  // checks table is even printed — a different, earlier-firing gate this test does not mean to
+  // exercise; claiming keeps this test on the CI-row-agreement question it is actually about).
+  colab(fx, ['claim', '55', '--branch', 'feat/clean-4', '--repo', fx.work]);
 
   const jr = colab(fx, ['ship', '--branch', 'feat/clean-4', '--repo', fx.work, '--dry', '--json']);
   const body = JSON.parse(jr.out);

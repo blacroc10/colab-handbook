@@ -31,6 +31,7 @@ const groupLabels = require('./lib/group-labels');
 const shipguard = require('./lib/shipguard');
 const migrationGrant = require('./lib/migration-grant');
 const ciGrant = require('./lib/ci-grant');
+const ciVerdict = require('./lib/ci-verdict');
 const {
   HOST, UserError, normIssueNum, issueTag, claimKey, today, nowISO, hoursSince,
   parseArgs, table, shortRepo,
@@ -1196,6 +1197,14 @@ CI grant merges into a repo whose own test suite is known-failing:
      continuously since — a second exemption on a still-broken repo is exactly the failure this gate
      exists to prevent. Fix trunk by hand or revert the bad merge instead of granting again.
 
+     "Red" here (#155) is the SAME verdict \`ship\`'s trunk-CI-green check uses — an ordinary
+     still-running run is NOT red (nothing for a grant to exempt; \`ship\` would clear it on its own),
+     but a WEDGED run (queued with zero jobs, or stuck past a generous age backstop — the shape a
+     billing lockout or dead runner pool leaves) reclassifies to red, because \`ship\` cannot clear
+     that on its own either and this is the sanctioned door for exactly that case. Before #155 the
+     two commands computed this independently and disagreed: a grant could be minted for a state
+     \`ship\` would never consult it for, reading live in \`--list\` while doing nothing.
+
 HUMAN-ONLY, ENFORCED: both grant and revoke REFUSE (exit 1) unless COLAB_HUMAN=1 is set in the
 environment — the identical bar \`colab promote\`/\`colab migration-grant\` already hold. No field,
 flag or project.yml value can lower it. This check runs BEFORE any network call.
@@ -1301,7 +1310,19 @@ function cmdCiGrantCreate(repoAbs, num, opts) {
   git.git(['fetch', 'origin', trunk], repoAbs);
   const trunkRun = git.ghRunForSha(repoAbs, trunk);
   if (!trunkRun) throw new UserError(`could not read ${trunk}'s CI status (gh run list failed) — refusing to grant blind`);
-  const trunkIsRed = !(trunkRun.status === 'completed' && trunkRun.conclusion === 'success');
+  // #155 fix 1+2: SAME classifier `shipCiCheck` uses (classifyCiRun), not an independent inline
+  // expression. "Red" here means exactly what it means to `ship` — HUMAN_GATED — so a grant can
+  // never be minted for a state `ship` would call SELF_CLEARING (an ordinary still-running run) and
+  // therefore never consult. Previously `!(status==='completed' && conclusion==='success')` called
+  // that same ordinary-running state "red", producing a grant that looked live in `--list` and was
+  // inert at the only place `ship` reads it.
+  const trunkVerdict = classifyCiRun(repoAbs, trunkRun, `${trunk}@${shortSha(trunkRun.sha)}`);
+  if (trunkVerdict.class === SELF_CLEARING) {
+    throw new UserError(
+      `${trunk} is not red in the sense \`ship\` checks — ${trunkVerdict.detail}. A grant would not be ` +
+      'honored (ship never consults a grant for a self-clearing state); wait for the run to finish, or re-run once it does.');
+  }
+  const trunkIsRed = trunkVerdict.class === HUMAN_GATED;
   const redSha = trunkRun.sha;
 
   // Heuristic, bounded-window scan for a prior grant-authorized merge (the `CI-Grant:` trailer,
@@ -4505,6 +4526,12 @@ not this branch's work, \`--refs <N>\` if it is related but not completed here �
 the check: a wrong \`Closes #N\` closes the issue the instant trunk is pushed and stays in an
 immutable commit message afterwards.
 
+A ZERO-CLAIM RESOLUTION (#153) splits on what the BRANCH NAME says. No trailing issue-number group
+→ a legitimate zero (chore, docs, evidence-close): warn, continue. A trailing group present but the
+LOCAL claim registry has nothing for it → refuse: claims are written to both local state and GitHub,
+but this resolution reads only the local registry, so the likely cause is the claim living on
+ANOTHER MACHINE — ship from there, or \`colab claim <N> --branch <br>\` to take it over here.
+
 MIGRATION GRANTS (#98) are the ONE narrow, human-created exception to the no-new-migrations
 precondition — for an issue whose entire deliverable IS a schema change, which the gate would
 otherwise make permanently un-shippable unattended. Create one with
@@ -4796,18 +4823,43 @@ function shipCiCheck(repoAbs, gh, target, trunk, grantThunk) {
   }
   if (!run) return { name, ok: false, class: SELF_CLEARING, detail: 'gh run list failed', grantVerdict: null };
   const at = `${via}@${shortSha(run.sha)}`;
+  const verdict = classifyCiRun(repoAbs, run, at);
+  if (verdict.ok || verdict.class !== HUMAN_GATED) return { name, ...verdict, grantVerdict: null };
+  return applyCiGrant({ name, ...verdict }, target, trunk, run.sha, grantThunk);
+}
+
+/**
+ * The SINGLE verdict for one measured CI run (#155 fix 1) — called by BOTH `shipCiCheck` above and
+ * `cmdCiGrantCreate`'s `trunkIsRed` below, so the two can no longer independently disagree about
+ * whether a given run counts as red. Previously `cmdCiGrantCreate` computed its own inline
+ * `!(status==='completed' && conclusion==='success')`, which called a run "red" the moment it was
+ * anything other than a successful completion — including an ORDINARY STILL-RUNNING run, which
+ * `shipCiCheck` classifies SELF_CLEARING (retry later, never consult a grant). A grant minted
+ * against that state looked live in `ci-grant --list` and was inert at the only place `ship` reads it.
+ *
+ * `run` is the `{status, conclusion, sha, createdAt, databaseId}` shape `ghRunForSha` returns; `at`
+ * is the already-formatted `<ref>@<shortsha>` used in every detail string.
+ *
+ * The job-count read (`ghRunJobCount`) is made HERE, lazily, only for a run that is already
+ * non-completed and therefore a wedge candidate — an ordinary green or plain-failed check never
+ * pays for it, matching `ghRunJobCount`'s own doc comment.
+ */
+function classifyCiRun(repoAbs, run, at) {
   if (run.status === 'completed') {
-    if (run.conclusion === 'success') return { name, ok: true, class: null, detail: `run for ${at}: success`, grantVerdict: null };
-    return applyCiGrant(
-      { name, ok: false, class: HUMAN_GATED, detail: `run for ${at}: status=completed conclusion=${run.conclusion || 'none'}` },
-      target, trunk, run.sha, grantThunk);
+    if (run.conclusion === 'success') return { ok: true, class: null, detail: `run for ${at}: success` };
+    return { ok: false, class: HUMAN_GATED, detail: `run for ${at}: status=completed conclusion=${run.conclusion || 'none'}` };
   }
   if (run.status === 'none') {
-    return applyCiGrant(
-      { name, ok: false, class: HUMAN_GATED, detail: `no run for ${at} — CI is not wired for this ref, or never started for this commit` },
-      target, trunk, run.sha, grantThunk);
+    return { ok: false, class: HUMAN_GATED, detail: `no run for ${at} — CI is not wired for this ref, or never started for this commit` };
   }
-  return { name, ok: false, class: SELF_CLEARING, detail: `run for ${at}: status=${run.status} — still running, retry later`, grantVerdict: null };
+  // Non-completed, non-none: running/queued/etc. Ordinarily SELF_CLEARING — but #155's wedged
+  // shape (queued, zero jobs, unmoving for hours) can never clear on its own, so check for it.
+  const jobCount = run.databaseId != null ? git.ghRunJobCount(repoAbs, run.databaseId) : null;
+  const wedge = ciVerdict.wedgedVerdict({ status: run.status, createdAt: run.createdAt, jobCount });
+  if (wedge.wedged) {
+    return { ok: false, class: HUMAN_GATED, detail: `run for ${at}: status=${run.status} — WEDGED (${wedge.reason}); a human must look, not retry` };
+  }
+  return { ok: false, class: SELF_CLEARING, detail: `run for ${at}: status=${run.status} — still running, retry later` };
 }
 
 /**
@@ -5045,6 +5097,23 @@ function cmdShipDryJson(opts) {
     detail: dryCorr.ok
       ? (closeIssues.length ? `${closeIssues.length} closing issue(s) named by the branch or its commits` : 'none to close')
       : `${dryCorr.uncorroborated.map((u) => '#' + u.issue).join(' ')} claimed but named by NEITHER the branch name nor any commit body — a co-tenant claim would be closed by this ship` });
+
+  // #153: same zero-claim verdict the prose path applies — a caller reading only `checks[]`/`ok`
+  // (this JSON path exists precisely for unattended callers) used to see NO check at all here, so a
+  // branch whose name claims issues the local registry has nothing for reported `ok: true`.
+  const dryBrokenClaims = Object.values(st.claims).filter((c) => c.repo === repoAbs &&
+    (records.branchProblem(c.branch) || (c.branch && !git.branchExists(repoAbs, c.branch))));
+  const dryZeroVerdict = shipguard.zeroClaimVerdict(sess.issues.length, sess.branch, dryBrokenClaims.length);
+  if (dryZeroVerdict.relevant) {
+    const okZero = !dryZeroVerdict.refuse;
+    const detail = dryZeroVerdict.reason === 'broken-claims'
+      ? `${dryBrokenClaims.length} claim(s) in this repo name a branch that resolves to no ref — registry is broken, not the branch`
+      : dryZeroVerdict.reason === 'branch-names-issues'
+        ? `branch name claims ${dryZeroVerdict.named.map((n) => '#' + n).join(' ')} but this machine's ("${HOST}") registry has nothing for it (#153) — claim may live on another machine`
+        : 'branch name carries no issue numbers — a legitimate zero (chore / evidence-close)';
+    checks.push({ name: 'issues resolved (not zero-by-registry-gap)', ok: okZero,
+      class: okZero ? null : HUMAN_GATED, detail });
+  }
 
   // #90: "branch has commits" — the precondition whose absence told an unattended caller `ok: true`
   // about a branch that could not ship. It is NOT a failure when the branch qualifies for
@@ -5345,10 +5414,11 @@ function cmdShip(argv) {
   const claimRemedy = sess.name
     ? `colab claim <N> --worktree ${sess.name} --branch ${sess.branch}`
     : `colab claim <N> --branch ${sess.branch}`;
-  if (sess.issues.length === 0) {
+  const zeroVerdict = shipguard.zeroClaimVerdict(sess.issues.length, sess.branch, brokenClaims.length);
+  if (zeroVerdict.relevant) {
     warn('this branch resolves to ZERO claimed issues — the squash will carry NO `Closes #N`,');
     warn('  so anything it fixes stays open with its code already merged (CONVENTIONS.md §4).');
-    if (brokenClaims.length) {
+    if (zeroVerdict.reason === 'broken-claims') {
       process.stderr.write(`✗ Refusing: ${brokenClaims.length} claim(s) in this repo name a branch that resolves to no ref,\n`);
       for (const c of brokenClaims) {
         process.stderr.write(`    ${c.issue}  branch ${c.branch === null ? 'null' : `"${c.branch}"`}${c.worktree ? ` · worktree ${c.worktree}` : ''}\n`);
@@ -5356,6 +5426,15 @@ function cmdShip(argv) {
       process.stderr.write('  so "no claims" here is a broken lookup, not a fact about this branch. Repair, then re-run:\n');
       process.stderr.write(`    colab release <N> && ${claimRemedy}\n`);
       process.stderr.write('  (through the CLI — several sessions write ~/.colab/state.json, so a hand edit can lose one.)\n');
+      return 1;
+    }
+    if (zeroVerdict.reason === 'branch-names-issues') {
+      process.stderr.write(`✗ Refusing: the branch name claims issue(s) ${zeroVerdict.named.map((n) => '#' + n).join(' ')}, ` +
+        `but this machine's (\`${HOST}\`) claim registry has nothing for this branch (#153).\n`);
+      process.stderr.write('  Claims are written to both local state and GitHub, but this resolution reads only the local\n');
+      process.stderr.write(`  registry — so "no claims" here likely means the claim lives on ANOTHER MACHINE. Either:\n`);
+      process.stderr.write(`    - ship from the machine that holds the claim, or\n`);
+      process.stderr.write(`    - take the claim over here:  ${claimRemedy}\n`);
       return 1;
     }
     warn('  Nothing contradicts it, so ship continues. If this branch was meant to close an issue,');

@@ -155,6 +155,9 @@ test('--dry --json: a branch with no commits of its own to ship is a clean, all-
   fx.g(fx.work, 'add', '-A');
   fx.g(fx.work, 'commit', '-q', '-m', 'feat: add g');
   fx.g(fx.work, 'checkout', '-q', 'main');
+  // Claimed (#153: an unclaimed branch whose NAME ends in an issue number now refuses before
+  // reaching this table — a different, earlier gate than the one this test means to exercise).
+  colab(fx, ['claim', '5', '--branch', 'feat/clean-5', '--repo', fx.work]);
 
   const r = colab(fx, ['ship', '--branch', 'feat/clean-5', '--repo', fx.work, '--dry', '--json']);
   const body = JSON.parse(r.out);

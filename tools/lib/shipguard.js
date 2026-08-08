@@ -264,8 +264,44 @@ function closesCoverage({ message, closeIssues, refsIssues = [], commits = [] })
   return { ok: missing.length === 0, missing, dropped, stray };
 }
 
+/**
+ * #153: what a ZERO-claim resolution means, and whether ship should warn or refuse.
+ *
+ * A branch can resolve to zero claimed issues for two structurally different reasons, and only one
+ * of them is safe to warn-and-continue on:
+ *
+ *   - the branch never claimed to close anything (no trailing issue-number group in its name) — a
+ *     chore, a doc fix, a deliberate zero-diff evidence-close. Warn; nothing contradicts it.
+ *   - the branch NAME says it carries issues, but the local claim registry has nothing for them.
+ *     That contradiction is the shape measured in #153: a sweep run on a machine that does not hold
+ *     the claim (claims are written to both local state and GitHub, but ship's issue resolution used
+ *     to read only the local registry) reported "(none claimed)", every precondition passed, and the
+ *     branch would have merged with no `Closes #N` — leaving the issues open with their code already
+ *     on trunk. Ruling (2026-08-08, option B): refuse here, because the branch's own name is evidence
+ *     the registry is the one that's wrong, not the work.
+ *
+ * `brokenClaimsCount` is evaluated FIRST and independently: a claim that already names a branch which
+ * resolves to no ref is a stronger, pre-existing signal (the registry itself is provably broken, #53)
+ * and refuses regardless of what the branch name says — that behavior predates this function and is
+ * unchanged by it.
+ *
+ * Callers with issuesCount > 0 should not call this at all — `relevant: false` says so defensively,
+ * so a caller that does anyway gets an inert verdict rather than a silently wrong one.
+ */
+function zeroClaimVerdict(issuesCount, branchName, brokenClaimsCount) {
+  if (issuesCount > 0) return { relevant: false, ok: true, refuse: false, reason: null };
+  if (brokenClaimsCount > 0) {
+    return { relevant: true, ok: false, refuse: true, reason: 'broken-claims' };
+  }
+  const named = branchIssueNumbers(branchName);
+  if (named.length > 0) {
+    return { relevant: true, ok: false, refuse: true, reason: 'branch-names-issues', named };
+  }
+  return { relevant: true, ok: true, refuse: false, reason: 'legit-zero' };
+}
+
 module.exports = {
   branchIssueNumbers, commitIssueNumbers, corroborateIssues, branchType,
   subjectSanity, bodyShaClaims, evidenceComments, hasEvidence, TOOL_MARKS,
-  closesCoverage,
+  closesCoverage, zeroClaimVerdict,
 };

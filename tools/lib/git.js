@@ -337,14 +337,19 @@ function ghRunForSha(repo, branch, limit = 10) {
   const sha = (head.stdout.split('\n')[0] || '').split('\t')[0].trim();
   if (!sha) return null; // branch does not exist on origin
 
-  const r = run('gh', ['run', 'list', '--branch', branch, '-L', String(limit), '--json', 'headSha,status,conclusion'], { cwd: repo });
+  // createdAt + databaseId are additive (#155): a NON-completed pick needs both to let a caller
+  // judge whether it is merely slow or structurally WEDGED (tools/lib/ci-verdict.js) — createdAt for
+  // the age backstop, databaseId to look up its job count (ghRunJobCount, below — a second call, made
+  // lazily by the caller, never here: an ordinary green check must not pay for a read it never needs).
+  const r = run('gh', ['run', 'list', '--branch', branch, '-L', String(limit),
+    '--json', 'headSha,status,conclusion,createdAt,databaseId'], { cwd: repo });
   if (!r.ok) return null;
   let runs;
   try { runs = JSON.parse(r.stdout); } catch (_) { return null; }
   if (!Array.isArray(runs)) return null;
 
   const forSha = runs.filter((x) => x && x.headSha === sha);
-  if (forSha.length === 0) return { status: 'none', conclusion: null, sha };
+  if (forSha.length === 0) return { status: 'none', conclusion: null, sha, createdAt: null, databaseId: null };
 
   // A completed sibling whose conclusion is anything but success or cancelled makes the sha
   // not-green, regardless of any sibling that succeeded — checked BEFORE the success check below,
@@ -352,17 +357,37 @@ function ghRunForSha(repo, branch, limit = 10) {
   const notGreen = forSha.find(
     (x) => x.status === 'completed' && x.conclusion !== 'success' && x.conclusion !== 'cancelled',
   );
-  if (notGreen) return { status: 'completed', conclusion: notGreen.conclusion, sha };
+  if (notGreen) return { status: 'completed', conclusion: notGreen.conclusion, sha, createdAt: notGreen.createdAt || null, databaseId: notGreen.databaseId || null };
 
   const success = forSha.find((x) => x.status === 'completed' && x.conclusion === 'success');
-  if (success) return { status: 'completed', conclusion: 'success', sha };
+  if (success) return { status: 'completed', conclusion: 'success', sha, createdAt: success.createdAt || null, databaseId: success.databaseId || null };
 
   // None succeeded and none failed for this sha — report the most informative row: a run still in
   // flight (it may yet succeed) over a finished-but-not-successful one (gh returns newest-first;
   // forSha[0] is the newest of the non-successes either way).
   const pending = forSha.find((x) => x.status !== 'completed');
   const pick = pending || forSha[0];
-  return { status: pick.status, conclusion: pick.conclusion || null, sha };
+  return { status: pick.status, conclusion: pick.conclusion || null, sha, createdAt: pick.createdAt || null, databaseId: pick.databaseId || null };
+}
+
+/**
+ * Job count for one workflow run (#155) — how many jobs GitHub has attached to it. A queued run
+ * with ZERO jobs has not been picked up by any runner: the measured shape of a billing lockout or a
+ * dead runner pool, and the PRIMARY signal tools/lib/ci-verdict.js uses to call a non-completed run
+ * WEDGED rather than merely slow. Deliberately a separate call from `ghRunForSha` (never folded into
+ * its `--json` field list): job counts require `gh run view`, one call per run, and the ordinary
+ * green-trunk ship makes zero of these — callers fetch it lazily, only for a run that is already
+ * non-completed and therefore a wedge candidate.
+ *
+ * Returns the job count, or null if it could not be read (gh failure, run gone) — null must NOT be
+ * read as zero; a caller that cannot measure this falls back to the age backstop alone.
+ */
+function ghRunJobCount(repo, runDatabaseId) {
+  if (runDatabaseId === null || runDatabaseId === undefined) return null;
+  const r = run('gh', ['run', 'view', String(runDatabaseId), '--json', 'jobs', '-q', '.jobs | length'], { cwd: repo });
+  if (!r.ok) return null;
+  const n = Number(r.stdout);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
@@ -381,6 +406,6 @@ module.exports = {
   run, git, repoRoot, mainRepoRoot, originUrl, detectTrunk, branchExists, existingBranchRef,
   worktreeList, worktreeListDetailed, dirtyTracked, dirtyUntracked, dirtyAny,
   ghAvailable, ghIssueEdit, ghListLabels, ghAssignedIssues,
-  ghCurrentLogin, ghIssueView, ghIssueComment, ghRunForSha,
+  ghCurrentLogin, ghIssueView, ghIssueComment, ghRunForSha, ghRunJobCount,
   ghIssueListByLabel, ghLabelDelete,
 };

@@ -236,3 +236,39 @@ test('closesCoverage: no claimed issues at all is vacuously ok', () => {
   assert.strictEqual(r.ok, true);
   assert.deepStrictEqual(r.missing, []);
 });
+
+// --- #153: zero-claim resolution — warn on a legit zero, refuse on a registry gap -------------
+
+test('zeroClaimVerdict: irrelevant when issuesCount > 0 — a caller must not act on this at all', () => {
+  const r = g.zeroClaimVerdict(2, 'fix/import-fixes-115-114-113', 0);
+  assert.strictEqual(r.relevant, false);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.refuse, false);
+});
+
+test('zeroClaimVerdict: a branch with NO trailing issue-number group is a legit zero — warn, continue', () => {
+  const r = g.zeroClaimVerdict(0, 'docs/code-wrap-issue-sweep', 0);
+  assert.strictEqual(r.relevant, true);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.refuse, false);
+  assert.strictEqual(r.reason, 'legit-zero');
+});
+
+test('zeroClaimVerdict: the #153 shape exactly — branch NAME claims issues, registry has none — refuse', () => {
+  const r = g.zeroClaimVerdict(0, 'fix/some-fix-71-76', 0);
+  assert.strictEqual(r.relevant, true);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.refuse, true);
+  assert.strictEqual(r.reason, 'branch-names-issues');
+  assert.deepStrictEqual(r.named, [71, 76]);
+});
+
+test('zeroClaimVerdict: a broken claim record refuses regardless of the branch name (pre-existing #53 behavior, unchanged)', () => {
+  const namedBranch = g.zeroClaimVerdict(0, 'fix/some-fix-71', 1);
+  assert.strictEqual(namedBranch.reason, 'broken-claims');
+  assert.strictEqual(namedBranch.refuse, true);
+
+  const unnamedBranch = g.zeroClaimVerdict(0, 'docs/tidy', 1);
+  assert.strictEqual(unnamedBranch.reason, 'broken-claims');
+  assert.strictEqual(unnamedBranch.refuse, true);
+});
