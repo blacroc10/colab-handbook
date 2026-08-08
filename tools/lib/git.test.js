@@ -258,6 +258,26 @@ test('a failed sibling wins regardless of array order — success listed first s
   assert.deepStrictEqual(result, { status: 'completed', conclusion: 'failure', sha: fx.sha });
 });
 
+test('a timed_out sibling of a passing run on the SAME sha reads red, not green (#165)', () => {
+  const fx = fixture();
+  // #146 closed any-green for `failure` specifically; #165 is the same shape one conclusion value
+  // over — a `timed_out` sibling must be caught by the same all-green contract.
+  const result = fx.withFakeGh([
+    { headSha: fx.sha, status: 'completed', conclusion: 'success' },
+    { headSha: fx.sha, status: 'completed', conclusion: 'timed_out' },
+  ], () => git.ghRunForSha(fx.work, 'main'));
+  assert.deepStrictEqual(result, { status: 'completed', conclusion: 'timed_out', sha: fx.sha });
+});
+
+test('an action_required sibling of a passing run on the SAME sha reads red, not green (#165)', () => {
+  const fx = fixture();
+  const result = fx.withFakeGh([
+    { headSha: fx.sha, status: 'completed', conclusion: 'action_required' },
+    { headSha: fx.sha, status: 'completed', conclusion: 'success' },
+  ], () => git.ghRunForSha(fx.work, 'main'));
+  assert.deepStrictEqual(result, { status: 'completed', conclusion: 'action_required', sha: fx.sha });
+});
+
 test('the sha has runs but none succeeded — surfaces the most informative one, not a false none', () => {
   const fx = fixture();
   const result = fx.withFakeGh([

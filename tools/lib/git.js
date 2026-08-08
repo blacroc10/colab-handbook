@@ -321,10 +321,15 @@ function ghLabelDelete(repo, name) {
  *   - the branch does not exist on origin, or `git`/`gh` failed → null
  *
  * A cancelled sibling of a passing run on the SAME sha is not evidence of anything — it is simply
- * not read, because the passing run for that sha is what answers the question. A *failed* sibling
- * is a different matter: `forSha` holds one row per workflow, and green requires ALL of them to
- * have succeeded, not merely one (#146/#162) — a completed failure on the sha always wins over a
- * completed success sitting next to it, checked first, before any success short-circuits the read.
+ * not read, because the passing run for that sha is what answers the question. Any OTHER completed
+ * conclusion sitting next to it is a different matter: `forSha` holds one row per workflow, and
+ * green requires ALL of them to have succeeded (cancelled excepted), not merely one having
+ * succeeded (#146/#162/#165) — checked BEFORE the success check below, so a `failure`, `timed_out`,
+ * `action_required`, `startup_failure`, or any other not-success completed conclusion is never
+ * masked by a passing sibling on the same sha. This is deliberately an ALLOWLIST (only `success` and
+ * `cancelled` are not-bad) rather than a denylist of conclusion values as they get discovered —
+ * #146 covered `failure` alone and #165 was filed the moment a second denylist entry was on the
+ * table; inverting the quantifier once closes the whole family instead of chasing it value by value.
  */
 function ghRunForSha(repo, branch, limit = 10) {
   const head = run('git', ['ls-remote', 'origin', `refs/heads/${branch}`], { cwd: repo });
@@ -341,11 +346,13 @@ function ghRunForSha(repo, branch, limit = 10) {
   const forSha = runs.filter((x) => x && x.headSha === sha);
   if (forSha.length === 0) return { status: 'none', conclusion: null, sha };
 
-  // A completed failure anywhere in the sibling set makes the sha not-green, regardless of any
-  // sibling that succeeded — checked BEFORE the success check below, so a failing workflow is
-  // never masked by a passing one on the same sha.
-  const failed = forSha.find((x) => x.status === 'completed' && x.conclusion === 'failure');
-  if (failed) return { status: 'completed', conclusion: 'failure', sha };
+  // A completed sibling whose conclusion is anything but success or cancelled makes the sha
+  // not-green, regardless of any sibling that succeeded — checked BEFORE the success check below,
+  // so it is never masked by a passing one on the same sha.
+  const notGreen = forSha.find(
+    (x) => x.status === 'completed' && x.conclusion !== 'success' && x.conclusion !== 'cancelled',
+  );
+  if (notGreen) return { status: 'completed', conclusion: notGreen.conclusion, sha };
 
   const success = forSha.find((x) => x.status === 'completed' && x.conclusion === 'success');
   if (success) return { status: 'completed', conclusion: 'success', sha };
