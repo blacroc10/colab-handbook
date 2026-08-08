@@ -26,12 +26,14 @@
  * "the provider's read-after-write lag", not "one poll", and a receiver must be built for that.
  *
  * ── Why a detached child process, and not just fetch() ────────────────────────────────────────
- * The CLI ends at `process.exit(main(...))`, a hard exit that kills in-flight sockets. An
- * un-awaited fetch would therefore be silently dropped for exactly the operations worth reporting,
- * and awaiting it would mean plumbing async through a fully synchronous CLI *and* letting a hung
- * endpoint delay a command that has already done its real work. A detached, unref'd child owns the
- * request instead: the parent's cost is the spawn call, the child outlives the exit, and a receiver
- * that hangs is the child's problem — bounded by SEND_TIMEOUT_MS, invisible to the user.
+ * The CLI's process exits as soon as the event loop drains after main() returns — nothing here
+ * awaits the parent process, so an in-flight request has no guarantee of surviving to completion.
+ * An un-awaited fetch would therefore be silently dropped for exactly the operations worth
+ * reporting, and awaiting it would mean plumbing async through a fully synchronous CLI *and*
+ * letting a hung endpoint delay a command that has already done its real work. A detached, unref'd
+ * child owns the request instead: the parent's cost is the spawn call, the child outlives the
+ * parent's exit, and a receiver that hangs is the child's problem — bounded by SEND_TIMEOUT_MS,
+ * invisible to the user.
  *
  * ── The kind vocabulary is the receiver's, and it is CLOSED ───────────────────────────────────
  * Receivers reject an unrecognised `kind` with 400 and write nothing. That rejection is correct and

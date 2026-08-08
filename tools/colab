@@ -6257,6 +6257,15 @@ function main(argv) {
  * would be worse than none. Journalling happens after the message is printed and can never change
  * the exit code: the CLI's contract is its exit status, and an optional feature does not get to
  * touch it.
+ *
+ * SETS process.exitCode and lets Node exit on its own once stdout has drained, rather than
+ * calling process.exit(code). Writes to a pipe are asynchronous, so exiting immediately after a
+ * subcommand's print discards whatever is still buffered — the reader gets a payload cut at the
+ * pipe buffer (~8 KB macOS, ~64 KB Linux) with an exit code that still looks like the documented
+ * one, so nothing signals the truncation. `main()` here is entirely synchronous, so there is no
+ * async work left pending once we reach the end of this block; the only thing exitCode is waiting
+ * on is the stdout write Node already queued. See audit/audit.mjs's near-identical note for the
+ * sibling fix (same bug, found first via `colab doctor --json` — issue #147).
  */
 {
   const startedAt = Date.now();
@@ -6281,5 +6290,5 @@ function main(argv) {
   try {
     journal.invoked({ argv, exit: code, durationMs: Date.now() - startedAt, error: failure });
   } catch (_) { /* optional, never fatal */ }
-  process.exit(code);
+  process.exitCode = code;
 }
