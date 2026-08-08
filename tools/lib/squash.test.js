@@ -407,6 +407,62 @@ test('reconcileClosesRefsConflict is a no-op with no closeNums, and safe on a me
   assert.strictEqual(squash.reconcileClosesRefsConflict('fix: x\n\nno reference here', ['53'], []), 'fix: x\n\nno reference here');
 });
 
+// --- #149: inheritedClosingKeywordConflicts — a compose-time catch for a closing keyword sitting
+// in PROSE (a commit subject bullet), the exact shape reconcileClosesRefsConflict cannot touch ---
+
+test('inheritedClosingKeywordConflicts catches a closing keyword inside an ordinary prose bullet', () => {
+  // The live #149 report: a non-chosen commit's subject became a squash-body bullet, and its own
+  // prose ("close #58") was never a self-contained reference line — REF_LINE_RE would never match
+  // it, and that is exactly why it slipped through to a post-push warning before this existed.
+  const msg = [
+    'feat: ship half 2',
+    '',
+    'Refs #58',
+    '',
+    "- docs(...): document the deferred note, close #58 half 1's deferred note",
+  ].join('\n');
+  const hits = squash.inheritedClosingKeywordConflicts(msg, [58]);
+  assert.deepStrictEqual(hits, [{ num: '58', keyword: 'close' }]);
+});
+
+test('inheritedClosingKeywordConflicts recognises the full GitHub keyword vocabulary, case-insensitively', () => {
+  for (const kw of ['close', 'Closes', 'CLOSED', 'fix', 'Fixes', 'fixed', 'resolve', 'Resolves', 'resolved']) {
+    const hits = squash.inheritedClosingKeywordConflicts(`chore: x\n\n- ${kw} #7 in passing`, [7]);
+    assert.strictEqual(hits.length, 1, `expected a hit for keyword "${kw}"`);
+    assert.strictEqual(hits[0].num, '7');
+  }
+});
+
+test('inheritedClosingKeywordConflicts ignores a number NOT in refsIssues', () => {
+  assert.deepStrictEqual(squash.inheritedClosingKeywordConflicts('fix: x\n\nCloses #58', [59]), []);
+});
+
+test('inheritedClosingKeywordConflicts also catches the self-contained trailer-line shape (the #48 case)', () => {
+  // #149's fix subsumes the narrower case #48 already knew about (an inherited `Closes #N` line for
+  // a ref'd issue) — that one used to be a post-push-only warning; it is now caught here too, before
+  // the push, alongside the prose case #149 actually reported.
+  assert.deepStrictEqual(squash.inheritedClosingKeywordConflicts('feat: x\n\nCloses #48', [48]),
+    [{ num: '48', keyword: 'Closes' }]);
+});
+
+test('inheritedClosingKeywordConflicts is empty with no refsIssues, or no message', () => {
+  assert.deepStrictEqual(squash.inheritedClosingKeywordConflicts('fix: x\n\nCloses #58', []), []);
+  assert.deepStrictEqual(squash.inheritedClosingKeywordConflicts('', [58]), []);
+  assert.deepStrictEqual(squash.inheritedClosingKeywordConflicts(null, [58]), []);
+});
+
+test('inheritedClosingKeywordConflicts de-duplicates the same (num, keyword) pair repeated', () => {
+  const hits = squash.inheritedClosingKeywordConflicts('fix: x\n\nCloses #58\n\n- fix: y, closes #58 too', [58]);
+  assert.deepStrictEqual(hits, [{ num: '58', keyword: 'Closes' }]);
+});
+
+test('inheritedClosingKeywordConflicts accepts refsIssues as numbers or "#N" strings alike', () => {
+  assert.deepStrictEqual(squash.inheritedClosingKeywordConflicts('fix: x\n\nCloses #58', ['#58']),
+    [{ num: '58', keyword: 'Closes' }]);
+  assert.deepStrictEqual(squash.inheritedClosingKeywordConflicts('fix: x\n\nCloses #58', [58]),
+    [{ num: '58', keyword: 'Closes' }]);
+});
+
 // --- #119: closedIssueNumbers is the SAME recogniser spliceCloses uses — anti-drift ---
 
 test('closedIssueNumbers finds every Closes #N, de-duplicated, case-insensitive keyword', () => {

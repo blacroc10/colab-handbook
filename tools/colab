@@ -4641,6 +4641,11 @@ Options:
                       Comma-separated; each must be a claimed issue on the branch. An issue carrying
                       the "tracking" label is treated this way automatically, no flag needed. The
                       claim is still released either way — only Closes→Refs changes.
+                      #149: refuses BEFORE the push (real run and --dry alike) if the composed
+                      squash message carries a GitHub closing keyword (close/closes/closed/fix/
+                      fixes/fixed/resolve/resolves/resolved + #N) against a --refs'd N — e.g. an
+                      inherited commit subject that mentions "close #N" in prose. Reword the
+                      offending commit and re-run; nothing is rewritten on your behalf.
   --keep-worktree     do not remove the worktree after shipping
   --delete-branch     delete the branch (local + remote) after shipping — off by default
   --dry               print the plan + precondition table and change NOTHING
@@ -5172,6 +5177,25 @@ function cmdShipDryJson(opts) {
     checks.push({ name: 'branch has commits', ok: true, class: null, detail: `${dryCommits.length} vs ${target}` });
   }
 
+  // #149: the same inherited-closing-keyword scan the prose --dry path runs, mirrored here —
+  // following #153's own precedent for this function (its comment above: "a caller reading only
+  // checks[]/ok … used to see NO check at all here"). Without this, the ONE caller class this path
+  // exists for — unattended — would read `ok: true` on a branch whose composed message defeats its
+  // own --refs. Only meaningful for the squash path: evidence-close never composes this message.
+  if (!dryMode.evidenceClose && refsIssues.length) {
+    const builtForJson = opts.message
+      ? squash.spliceCloses(opts.message, closeIssues, refsIssues, [])
+      : buildSquashMessage(repoAbs, target, sess.branch, closeIssues, refsIssues);
+    const inheritedJson = builtForJson ? squash.inheritedClosingKeywordConflicts(builtForJson, refsIssues) : [];
+    checks.push({
+      name: 'no inherited closing keyword against --refs', ok: inheritedJson.length === 0,
+      class: inheritedJson.length === 0 ? null : HUMAN_GATED,
+      detail: inheritedJson.length === 0
+        ? `${refsIssues.length} ref'd issue(s), no closing keyword found against them in the composed message`
+        : `${inheritedJson.map((c) => `"${c.keyword} #${c.num}"`).join(', ')} would close a --refs'd issue on merge — reword before shipping`,
+    });
+  }
+
   return emit(checks.every((c) => c.ok));
 }
 
@@ -5559,7 +5583,25 @@ function cmdShip(argv) {
   }
 
   if (opts.dry) {
-    print(preOk ? '→ READY: preconditions pass. Re-run without --dry to ship.' : '→ NOT READY: fix the ✗ rows above.');
+    // #149 (Option C, the partial the issue itself names as low-cost): a --dry run is the last
+    // moment an inherited GitHub closing keyword against a `--refs` issue can be caught before the
+    // push that makes it permanent. Compute the SAME composed message the real B1 would build (or
+    // splice, for --message) and scan it here too — this is deliberately the identical detection
+    // the real path refuses on below, just reported instead of enforced, since --dry changes nothing.
+    let subjectLine, dryClosingConflicts = [];
+    if (!mode.evidenceClose) {
+      let builtForDry;
+      if (opts.message) {
+        builtForDry = squash.spliceCloses(opts.message, closeIssues, refsIssues, []);
+        subjectLine = `${opts.message} [--message]`;
+      } else {
+        builtForDry = buildSquashMessage(repoAbs, target, sess.branch, closeIssues, refsIssues);
+        subjectLine = builtForDry ? builtForDry.split('\n')[0] : '(none — branch has no commits of its own; pass --message)';
+      }
+      if (refsIssues.length && builtForDry) dryClosingConflicts = squash.inheritedClosingKeywordConflicts(builtForDry, refsIssues);
+    }
+    const dryOk = preOk && dryClosingConflicts.length === 0;
+    print(dryOk ? '→ READY: preconditions pass. Re-run without --dry to ship.' : '→ NOT READY: fix the ✗ rows above.');
     if (mode.evidenceClose) {
       print('  Plan: no merge, no commit, no push · post evidence comment + CLOSE each issue · ' +
         (opts.keepWorktree ? 'keep worktree' : 'worktree rm') + ' (releases claims)');
@@ -5577,17 +5619,13 @@ function cmdShip(argv) {
     // An empty default (#57) means the branch has no commits of its own to derive a subject from —
     // say that plainly rather than printing a blank line that reads like a rendering glitch.
     if (!mode.evidenceClose) {
-      let subjectLine;
-      if (opts.message) {
-        subjectLine = `${opts.message} [--message]`;
-      } else {
-        const built = buildSquashMessage(repoAbs, target, sess.branch, closeIssues, refsIssues);
-        subjectLine = built ? built.split('\n')[0] : '(none — branch has no commits of its own; pass --message)';
-      }
       print('  Squash subject: ' + subjectLine);
+      for (const c of dryClosingConflicts) {
+        print(`  ✗ "${c.keyword} #${c.num}" would close #${c.num} on merge — kept open by --refs; reword the commit before shipping.`);
+      }
     }
     if (refsIssues.length) print(`  Refs (kept open, NOT closed): ${refsIssues.map((n) => '#' + n).join(' ')}`);
-    return preOk ? 0 : 1;
+    return dryOk ? 0 : 1;
   }
   if (!preOk) { process.stderr.write('✗ Aborting: one or more preconditions failed (see ✗ above). Nothing was pushed.\n'); return 1; }
 
@@ -5732,6 +5770,41 @@ function cmdShip(argv) {
     warn(`#${cf.num}: the branch commit said "${cf.from} #${cf.num}" but this ship closes it (${cf.to} #${cf.num}) — inherited trailer dropped, kept ship's own.`);
   }
 
+  // #149: refuse BEFORE the push if the composed message — subject, inherited bullets, chosen body,
+  // trailers, all of it — carries a GitHub closing keyword against a `--refs` issue.
+  //
+  // WHY COMPOSE TIME, NOT A BETTER POST-PUSH MESSAGE. This is the same class of bug #123 fixed a
+  // few commits below in history: a check that reports success without having actually verified
+  // the one fact that matters. Before this, the ONLY detection was B4 (below) re-reading the
+  // issue's state after the push and warning if it read CLOSED — accurate, but too late to matter.
+  // The commit prose that causes the wrong close is IMMUTABLE the moment it is pushed: the tracker
+  // can be reopened by hand, but the repository permanently keeps a closing keyword pointing at an
+  // issue that was meant to stay open, and re-running anything later just re-raises the identical
+  // warning with nothing left to fix. A pre-push refusal is not tidier phrasing of the same
+  // message — it is the only point in the sequence where the mistake still costs a re-word instead
+  // of a permanent scar. Nothing has reached the remote yet here: B0's sync (above) is a local
+  // merge, B1's squash-merge (below) is still local too — refusing now is free.
+  //
+  // COMPOSES WITH #153, DOES NOT COLLIDE. #153's zero-claim refusal (`zeroClaimVerdict`, well above
+  // this point — it can `return 1` before the precondition table is even printed) fires whenever a
+  // branch resolves to ZERO claimed issues. `refsIssues` is always a subset of `sess.issues`, so a
+  // branch #153 refuses necessarily has an EMPTY `refsIssues` too — there is nothing here for this
+  // check to scan, and the two can never both produce a verdict for the same ship. #153 firing IS
+  // this check's guarantee that `refsIssues`, by the time it gets here, names issues this session
+  // genuinely holds — not a coincidence of ordering to preserve carefully, but the reason this
+  // check is allowed to trust the list it is given.
+  if (refsIssues.length) {
+    const inherited = squash.inheritedClosingKeywordConflicts(commitMsg, refsIssues);
+    if (inherited.length) {
+      cleanupEphemeral(); cleanupTarget();
+      process.stderr.write(`✗ B1: the composed squash message would close ${inherited.length > 1 ? 'issues' : 'an issue'} kept open by --refs:\n`);
+      for (const c of inherited) process.stderr.write(`    "${c.keyword} #${c.num}" — #${c.num} was passed to --refs to stay open\n`);
+      process.stderr.write('  Reword the offending commit (drop or rephrase the closing keyword) and re-run.\n');
+      process.stderr.write('  Nothing pushed.\n');
+      return 1;
+    }
+  }
+
   // #119: re-read the FINAL message — exactly what is about to be committed, including any
   // --message override and the CI-Grant trailer appended above — and assert it actually closes
   // everything ship resolved to close. See lib/shipguard.js's closesCoverage doc for why `missing`
@@ -5839,8 +5912,10 @@ function cmdShip(argv) {
       const isRef = refsSet.has(num);
       const info = git.ghIssueView(repoAbs, num, ['state', 'labels']);
       // A closed issue must have auto-closed; a ref'd (tracking) issue must have STAYED open. The
-      // second check catches the one case the pure layer cannot fix: a carried commit body that
-      // literally says `Closes #N` for a ref issue — GitHub honours it and closes the memory issue.
+      // second check is now a BACKSTOP (#149 moved the primary catch to before the push — see the
+      // `inheritedClosingKeywordConflicts` refusal above) for whatever slips past it: a closing
+      // keyword this repo's own regex doesn't yet recognise, an `owner/repo#N` cross-repo form, or
+      // any other GitHub closing-keyword shape this scan does not cover.
       if (!isRef && info && info.state !== 'CLOSED') warn(`#${num} did not auto-close (state=${info.state}) — the Closes trailer needs a push to the DEFAULT branch; close it by hand if ${target} isn't default`);
       if (isRef && info && info.state === 'CLOSED') warn(`#${num} was meant to stay open (Refs, tracking issue) but is CLOSED — a commit body likely carries "Closes #${num}"; reopen it by hand`);
       for (const gl of labels.groupLabelNames(info && info.labels)) groupLabelsCarried.add(gl);

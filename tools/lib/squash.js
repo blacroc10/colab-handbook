@@ -174,11 +174,19 @@ const REF_CLAUSE_RE = /([Cc]loses|[Rr]efs) #(\d+)/g;
  * caller's "already present" check already declines to repeat.
  *
  * Deliberately NOT symmetric: an inherited `Closes #N` for a number ship intends to `Refs` (a
- * tracking issue, #48) is left alone here. `composeSquashMessage`'s doc comment explains why that
- * half stays a post-push warning instead of a rewrite — GitHub reads the carried `Closes #N` and
- * closes the issue regardless of what this pure layer emits, so stripping the text would produce a
- * message that reads correct while the actual merge still closes the memory issue silently.
+ * tracking issue, #48) is left alone HERE — this function only ever DROPS/REWRITES a self-contained
+ * `Refs`/`Closes` line, and rewriting a human-authored `Closes #N` into something else would produce
+ * a squash message that reads correct while GitHub still closes the memory issue on merge, because
+ * GitHub reads the carried text regardless of what this pure layer emits.
  *
+ * That gap is real, but as of #149 it is closed a different way — not by rewriting here, but by
+ * `inheritedClosingKeywordConflicts` below, which SCANS (never edits) the fully composed message for
+ * any GitHub closing keyword against a `--refs` number, in prose or in a self-contained line alike,
+ * and lets the caller (`colab ship`) REFUSE before the push. Refusing is safe to be symmetric about
+ * in a way rewriting never was: the operator still authors the final text, ship just declines to
+ * commit one that contradicts its own `--refs` intent. See that function's doc comment for the rest.
+ *
+
  * @param {string} message
  * @param {string[]} closeNums   normalised (no leading `#`) issue numbers ship will CLOSE
  * @param {Array} [conflicts]    when given, one `{num, from, to}` is pushed per clause dropped —
@@ -348,6 +356,69 @@ function closedIssueNumbers(message) {
   return [...out];
 }
 
+/**
+ * The full GitHub closing-keyword vocabulary, deliberately WIDER than `closedIssueNumbers` above
+ * (which matches only this repo's own composed `Closes #N`, on purpose — see its doc comment).
+ * This one exists to answer a different question: not "did WE write a closing trailer", but "will
+ * GITHUB read this text as one", because GitHub honours the full keyword set inside ANY commit
+ * text on the default branch, not just a trailer line this tool composed.
+ */
+const CLOSING_KEYWORD_RE = /\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#(\d+)\b/gi;
+
+/**
+ * #149: does `message` carry a GitHub closing keyword pointing at an issue `--refs` is keeping
+ * open?
+ *
+ * The gap this closes: `reconcileClosesRefsConflict` above only rewrites a self-contained
+ * `Closes #N` / `Refs #N` LINE — the shape ship's own composer produces. It has no opinion on a
+ * closing keyword sitting inside ordinary prose, because rewriting inside a sentence is not a safe
+ * mechanical operation (same reasoning as `REF_LINE_RE`'s doc comment). But GitHub does not care
+ * that the text is prose: `close #58` inside a carried commit SUBJECT ("docs: document X, close #58
+ * half 1's deferred note") auto-closes #58 on merge exactly as a trailer would, and #149 needed
+ * exactly this — a bullet built from a non-chosen commit's subject, which is squash body content by
+ * design (composeSquashMessage's doc comment above).
+ *
+ * Called BEFORE the push, on the exact string about to be committed — the composed message already
+ * exists at that point (spliceCloses / composeSquashMessage have both run), so this is knowable
+ * without any new git I/O. The caller decides what to do with a hit; this module stays pure and
+ * only reports.
+ *
+ * WHY BEFORE THE PUSH SPECIFICALLY, not just a clearer post-push message: the commit prose that
+ * triggers a wrong close is IMMUTABLE from the moment it lands on the default branch. GitHub's own
+ * close can be undone by a human reopening the tracker issue by hand, but the text that caused it
+ * cannot — it is now permanent in trunk's history, and every future read of it re-raises the same
+ * warning with nothing left to fix. A pre-push refusal and a post-push warning are not two
+ * severities of the same fix; only one of them is reachable while the mistake is still reversible.
+ *
+
+ * Deliberately checked against `refsIssues` only, not `closeIssues`: a closing keyword hitting a
+ * number ship already intends to CLOSE is not a conflict, it is redundant and harmless. It is only
+ * a conflict where the flag's entire purpose — keeping the issue open — is being undone by text the
+ * flag has no power to edit.
+ *
+ * @param {string} message
+ * @param {Array<number|string>} refsIssues   issue numbers this ship keeps OPEN (`--refs`)
+ * @returns {Array<{num:string, keyword:string}>}   one entry per DISTINCT (num, keyword) hit
+ */
+function inheritedClosingKeywordConflicts(message, refsIssues) {
+  const refSet = new Set((Array.isArray(refsIssues) ? refsIssues : []).map((n) => String(n).replace(/^#/, '')));
+  if (!refSet.size) return [];
+  const seen = new Set();
+  const out = [];
+  let m;
+  CLOSING_KEYWORD_RE.lastIndex = 0;
+  while ((m = CLOSING_KEYWORD_RE.exec(String(message || '')))) {
+    const num = m[2];
+    if (!refSet.has(num)) continue;
+    const keyword = m[1];
+    const key = `${num}:${keyword.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ num, keyword });
+  }
+  return out;
+}
+
 function spliceCloses(message, closes = [], refs = [], conflicts) {
   const norm = (arr) => (arr || []).map((n) => String(n).replace(/^#/, '')).filter(Boolean);
   const refNums = norm(refs);
@@ -384,4 +455,5 @@ module.exports = {
   TYPE_WEIGHT, BREAKING_BONUS, TRAILER_RE,
   isSyncNoise, parseSubject, commitWeight, unweightedCommits, pickSubjectIndex, harvestTrailers,
   composeSquashMessage, spliceCloses, reconcileClosesRefsConflict, closedIssueNumbers,
+  inheritedClosingKeywordConflicts,
 };
