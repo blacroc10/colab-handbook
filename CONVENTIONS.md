@@ -832,8 +832,9 @@ Where `colab` is installed, `colab readiness` is the owner of this write and the
 edit` is the portable fallback that does the identical label change. Owning it in colab is not
 cosmetic: the write is journaled like every other action, the label name has one source
 (`tools/lib/labels.js`, shared with the audit), and it is the single site the observer event
-(§ notify, kind `readiness.marked`) emits from — the receiver has agreed the kind and reads it
-as an optimistic "ready" hint bridging the provider's read-after-write lag.
+(kind `readiness.marked`, see [`tools/README.md`](tools/README.md) *notifyUrl*) emits from —
+the receiver has agreed the kind and reads it as an optimistic "ready" hint bridging the
+provider's read-after-write lag.
 
 The label is *derived* state, so it is only ever as fresh as its last check: whoever adds a
 blocker removes it. Prefer leaving it off to leaving it wrong — an absent label costs one
@@ -1838,10 +1839,11 @@ here.
    (Tier C)? **Deploying by hand does not make a repo Tier B** — the question is whether
    production exists, not whether shipping is automated ([§2](#2-tiers)).
 2. **Write `.github/project.yml`** ([§3](#3-githubprojectyml--the-marker)).
-3. **Create the labels — the whole set, not a subset.** They will not exist yet. All
-   twelve are required, because each powers a check that silently *cannot fire* while its
-   label is absent — and a check that never fires reads exactly like one that always
-   passes:
+3. **Create the labels — the whole set, not a subset.** They will not exist yet. Twelve
+   label names in total — the four `delivery:*` names share one bullet below, so the
+   explanatory list that follows reads nine — and all twelve are required, because each
+   powers a check that silently *cannot fire* while its label is absent — and a check that
+   never fires reads exactly like one that always passes:
    ```sh
    gh label create in-progress       --color FBCA04 --description "Claimed by an active session"  2>/dev/null || true
    gh label create deps-checked      --color 0E8A16 --description "Dependencies verified — no open blocker"  2>/dev/null || true
