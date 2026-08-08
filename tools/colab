@@ -6095,6 +6095,133 @@ function cmdLanded(argv) {
 }
 
 // ---------------------------------------------------------------------------
+// holders — "who else is holding this file?", the who-holds-this-file check from CONVENTIONS.md
+// §5 (Writing a conclusion down) and §11 (Quick reference), and code-start step 3, exposed as a
+// command instead of a documented one-liner (#152).
+//
+// The one-liner it replaces —
+//     git log --all --not origin/<trunk> --source --format='%S' -- <path> | sort -u
+// — lists EVERY ref that ever touched <path>, including branches whose work has long since
+// shipped: squash-merged, or landed and then the base moved on further. On a repo that has not
+// been recently swept that is not "who is editing this in parallel", it is "the whole history of
+// this file" — measured at 52 remote refs / 28 matching CONVENTIONS.md on this very repo, the
+// exact false-contention #152 was filed to fix.
+//
+// The fix is the same content question `colab landed` already answers per branch: does merging
+// this ref into the base change the base's tree at all. Run every candidate ref through it and
+// drop the ones classified `landed`. `unknown` is kept, on purpose — it means "look", never
+// "assume clear" (lib/landed.js): a caller that dropped `unknown` here would be the ONE case this
+// module exists to guard against, silently repeated one layer up.
+//
+// FRESHNESS IS THIS COMMAND'S OWN JOB, and that is the difference between a command and the
+// one-liner. The enumeration is `git log --all`, which reads LOCAL refs: a branch another session
+// pushed but this clone has never fetched simply does not exist to it. Answering "clean ground"
+// off that is a CONFIDENT verdict derived from missing data — the single worst output this command
+// can produce, and strictly worse than the one-liner it replaces, because a command name implies
+// the freshness problem is handled inside while the one-liner at least sat next to a documented
+// `git fetch --prune origin` in the very same code block.
+//
+// So: fetch by default, inside the command, and treat a fetch that did not happen as a reason to
+// REFUSE rather than to answer. `--no-fetch` exists for an offline or deliberately-pinned run, and
+// buys exactly one thing — the negative answers (rows found) still print, because "these refs hold
+// it" cannot be falsified by refs you have not seen. What it never buys is the affirmative:
+// "clean ground" requires freshness, always, on every path through this function.
+// ---------------------------------------------------------------------------
+
+const HELP_HOLDERS = `colab holders <path> [--base <br>] [--repo <path>] [--no-fetch] [--json]
+
+Who else is holding <path> — refs that touched it and have not landed on the base. Replaces the
+hand-copied one-liner (CONVENTIONS.md §5/§11, code-start step 3):
+
+    git fetch --prune origin
+    git log --all --not origin/<trunk> --source --format='%S' -- <path> | sort -u
+
+That query answers "which ref ever touched this path", not "which ref is live" — on a repo with
+any history of shipped work it reports spent branches as contention. This command runs every
+candidate ref through the same content classification \`colab landed\` uses (lib/landed.js) and
+drops the ones it reports \`landed\`. What remains is genuine cargo, or \`unknown\` (no confident
+answer — treat as a holder and look by hand, never assume clear).
+
+FETCHES FIRST, by default — the enumeration reads local refs, so a branch pushed by another
+session and never fetched here is invisible, and "clean ground" off that is a confident answer
+built on missing data. This command owns that problem instead of leaving it to the caller.
+
+  --base <br>   base to classify against (default: origin/<trunk> from .github/project.yml)
+  --repo <path> repo to run in (default: cwd)
+  --no-fetch    skip the fetch (offline, or a deliberately pinned view). Holders found are still
+                reported — they cannot be falsified by refs you have not seen — but a CLEAN result
+                is REFUSED (exit 2) rather than printed, because that one is unsound without it.
+  --json        machine-readable: [{ ref, branch, state, method, why }, ...]
+
+Empty output is clean ground ONLY when the fetch succeeded. Exit: 0 answered, 2 refused for
+staleness (fetch skipped or failed, and the result would have been "clean").
+`;
+
+function cmdHolders(argv) {
+  const opts = parseArgs(argv, {
+    values: { '--repo': 'repo', '--base': 'base' },
+    flags: { '--json': 'json', '--no-fetch': 'noFetch', '-h': 'help', '--help': 'help' },
+  });
+  if (opts.help || opts._.length === 0) return print(HELP_HOLDERS);
+  const repoAbs = resolveRepo(opts);
+  if (!git.repoRoot(repoAbs)) throw new UserError(`${repoAbs} is not a git repo`);
+  const filePath = opts._[0];
+  const baseRef = opts.base ? String(opts.base) : `origin/${landedBaseTrunk(repoAbs)}`;
+
+  // Freshness, established BEFORE the enumeration reads any ref. Bounded: a fetch against an
+  // unreachable remote otherwise hangs with no output, which would turn the safety step into the
+  // reason nobody runs the command. A repo with no remote at all is a legitimate local-only repo,
+  // not an error — but it is also not "fetched", so it takes the same refusal path below.
+  let fresh = false;
+  let staleWhy = '';
+  if (opts.noFetch) {
+    staleWhy = '--no-fetch was passed';
+  } else if (!git.git(['remote', 'get-url', 'origin'], repoAbs).ok) {
+    staleWhy = 'this repo has no `origin` remote to fetch from';
+  } else {
+    const f = git.git(['fetch', '--prune', 'origin'], repoAbs, { timeoutMs: 60000 });
+    if (f.ok) fresh = true;
+    else staleWhy = `git fetch --prune origin failed: ${(f.stderr || 'unknown error').split('\n')[0]}`;
+  }
+
+  const log = git.git(['log', '--all', '--not', baseRef, '--source', '--format=%S', '--', filePath], repoAbs);
+  if (!log.ok) throw new UserError(`git log failed: ${log.stderr || 'unknown error'}`);
+  const refs = [...new Set(log.stdout.split('\n').map((s) => s.trim()).filter(Boolean))];
+
+  const rows = refs
+    .map((ref) => {
+      // landedState's own facts include a `branch` key (the ref it was asked about) — spread it
+      // FIRST so our shorter display name below wins, not the other way round.
+      const short = ref.replace(/^refs\/heads\//, '').replace(/^refs\/remotes\/[^/]+\//, '');
+      return { ...landed.landedState(repoAbs, baseRef, ref), ref, branch: short };
+    })
+    // The one filter that matters: keep cargo AND unknown, drop only a confident `landed`.
+    // See the module banner above for why `unknown` must never be read as clear.
+    .filter((r) => r.state !== 'landed');
+
+  // THE REFUSAL, and it gates every affirmative path — table and --json alike. An empty result is
+  // the only verdict that depends on having seen every ref, so it is the only one freshness can
+  // invalidate. Non-empty output is reported regardless: refs you did not fetch cannot un-hold a
+  // file, so those rows are true either way, and withholding them would be its own failure.
+  if (!rows.length && !fresh) {
+    warn(`refusing to report "clean ground" for ${filePath}: ${staleWhy}.`);
+    warn('  The enumeration reads LOCAL refs, so a branch pushed elsewhere and not fetched here is');
+    warn('  invisible — an empty result would be a confident answer built on missing data.');
+    warn('  Fetch and re-run, or accept that this question has no sound answer offline.');
+    return 2;
+  }
+
+  if (opts.json) { print(JSON.stringify(rows, null, 2)); return 0; }
+  if (!rows.length) { print(`No holders of ${filePath} against ${baseRef} — clean ground.`); return 0; }
+  if (!fresh) warn(`${staleWhy} — these holders are real, but the list may be incomplete.`);
+  print(table(
+    rows.map((r) => [r.branch, r.state, r.why]),
+    ['REF', 'VERDICT', 'WHY'],
+  ));
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // promote — the checked door for PROMOTION (trunk → main), distinct from RELEASE (the tag).
 //
 // The ladder is: ship (branch → trunk) · promote (trunk → main) · release (tag, always human).
@@ -6367,6 +6494,9 @@ Commands:
   landed [--worktree N | --branch B | --all] [--base B] [--json]   has this work already landed?
                                         (the shared rule behind code-sweep's buckets — correct
                                         across squash merges, where "commits ahead" is not)
+  holders <path> [--base B] [--json]   who else is holding <path> — refs that touched it and
+                                        have not landed on the base (filters the raw git-log
+                                        one-liner through \`landed\`'s content classification)
   promote [--repo P] [--message M] [--dry]   trunk → main (--no-ff); gated by deploy + promotion; never tags
   doctor [--prune] [--ttl H] [--json] [--sync]
                                         heal dead worktrees / orphan + stale claims / orphan ports
@@ -6424,6 +6554,7 @@ function main(argv) {
     case 'worktrees': return cmdWorktrees(rest);
     case 'ship': return cmdShip(rest);
     case 'landed': return cmdLanded(rest);
+    case 'holders': return cmdHolders(rest);
     case 'promote': return cmdPromote(rest);
     case 'doctor': return cmdDoctor(rest);
     case 'release-notes': return cmdReleaseNotes(rest);

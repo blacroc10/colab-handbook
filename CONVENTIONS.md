@@ -881,12 +881,28 @@ kind of doc change, not a typo exempt from ceremony.
 adding a new file under one tree cannot conflict:
 
 ```sh
-git fetch --prune origin
-git log --all --not origin/<trunk> --source --format='%S' -- <path> | sort -u
+colab holders <path>          # fetches first; refuses to say "clean" if it could not
 ```
 
 Empty output (or a nonexistent path) is clean ground; non-empty is a file-level group —
-same branch, or sequence after theirs lands.
+same branch, or sequence after theirs lands. `colab holders` filters every ref that ever
+touched `<path>` through the same content classification `colab landed` uses, so a
+branch whose edit already shipped (squash-merged, or landed with the base moved on
+since) does not read as live contention — the raw `git log --all --not origin/<trunk>
+--source` sweep it replaces cannot tell the two apart, and a busy repo pays for that
+with false positives on every file. `unknown` still means *look*, never *assume clear*.
+
+**It fetches before it enumerates, and that is part of the check, not a convenience.**
+The enumeration reads *local* refs, so a branch another session pushed and this clone
+never fetched is invisible — and "clean ground" off that is a confident verdict built on
+missing data, which is the one wrong answer that sends a second session onto a held file.
+`--no-fetch` (offline, or a pinned view) therefore still reports holders it *can* see —
+refs you have not fetched cannot un-hold a file — but **refuses** the clean verdict with
+exit 2 instead of printing it.
+
+No `colab` installed: `git fetch --prune origin` **first**, then `git log --all --not
+origin/<trunk> --source --format='%S' -- <path> | sort -u` — the fetch is not optional
+there either, and every ref it lists is a candidate, not a verdict; check each by hand.
 
 **Never write the final artifact in the main checkout** — a throwaway draft in a
 git-ignored scratch directory is fine; the committed version belongs on a branch, in a
@@ -1238,7 +1254,9 @@ gh issue edit N --add-assignee @me --add-label in-progress
 git checkout -b feat/<slug>-N origin/<trunk>      # trunk = main (B) or dev (A)
 
 # editing a file that already exists — who else is holding it, by file not by issue
-git log --all --not origin/<trunk> --source --format='%S' -- <path> | sort -u
+# fetches first, filters spent branches out via `landed`, and REFUSES (exit 2) to answer
+# "clean ground" if it could not fetch — an empty result off stale refs is a wrong answer
+colab holders <path>
 
 # finishing work
 colab landed --worktree <name>                    # landed → teardown, cargo → merge

@@ -384,13 +384,25 @@ gh issue view $N --json labels -q '.labels[].name|select(startswith("group:"))'
   prose (`CONVENTIONS.md`, a skill, a README) that is the ordinary case, not the
   exotic one:
   ```sh
-  git log --all --not origin/<trunk> --source --format='%S' -- <path> | sort -u
+  colab holders <path>
   ```
-  Every ref printed is editing that file and has not landed. Empty output — or a path
-  that does not exist yet — is clean ground. Non-empty means group onto their branch,
-  or sequence after it lands; never a parallel branch on a file someone else is
-  holding (`CONVENTIONS.md` §5, *Writing a conclusion down*). Needs the `git fetch`
-  above to be meaningful.
+  Every row printed is a ref that touched `<path>` and has **not** landed — filtered
+  through the same content classification `colab landed` uses, not just "any ref that
+  ever touched it" (a busy repo's full history, otherwise: measured at 28 refs against
+  `CONVENTIONS.md` alone on this repo's own history, of which one held live work — and
+  that gap does not shrink by waiting for a sweep; a repo mid-teardown is still a repo
+  that has not finished one, which is exactly when this check has to be correct).
+  Empty output — or a path that does not
+  exist yet — is clean ground. Non-empty means group onto their branch, or sequence
+  after it lands; never a parallel branch on a file someone else is holding
+  (`CONVENTIONS.md` §5, *Writing a conclusion down*). **It fetches for you** — the
+  enumeration reads local refs, so a branch pushed by another session and never fetched
+  here would be invisible, and it refuses (exit 2) to report "clean ground" when it could
+  not fetch rather than answering off stale data. A row reporting `unknown` still means
+  *look*, never *assume clear*. No `colab` installed: `git fetch --prune origin` first,
+  then `git log --all --not origin/<trunk> --source --format='%S' -- <path> | sort -u` —
+  the fetch is not optional there either, and it is coarser besides, since it cannot tell
+  a shipped branch from a live one; check each ref by hand.
 
 This check is the deliberate price of unconditional release, not an oversight in it.
 

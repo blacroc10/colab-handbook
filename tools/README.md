@@ -55,6 +55,10 @@ colab worktree new feat/checkout-rewrite-42 --issues 42 --base v2
 # has this work already landed on its base? (correct across squash merges — "commits ahead" is not)
 colab landed --all
 
+# who else is holding this file — fetches, then filters the raw git-log sweep through `landed`
+# (refuses to answer "clean ground" if it could not fetch: an empty result off stale refs is wrong)
+colab holders CONVENTIONS.md
+
 # finish issues one at a time; siblings and the worktree survive
 colab release 114
 
