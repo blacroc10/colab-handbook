@@ -132,6 +132,16 @@ On `release` / `worktree rm` it posts `✅ Released` — **unless the issue is a
 which case it stays silent (a `Closes #N` merge already ended the story). Comments are
 **best-effort**: a failed comment warns but never fails the claim itself.
 
+**GraphQL rate limit → REST fallback, and self-describing residue (#164).** Claim comments, ship
+comments, and the release write (unassign + delabel) all go through `gh issue comment`/`gh issue
+edit`, which is GraphQL under the hood — a **separate** hourly quota from REST. If GraphQL is
+exhausted while REST still has budget, `ghIssueComment`/`ghIssueRelease` (`tools/lib/git.js`) retry
+once over the REST equivalent (`gh api`) instead of failing outright. If the release write still
+fails on **both** transports, `colab release` / `colab worktree rm` do **not** clear the local claim
+record — it is kept marked `releasePending` with a `releaseNote` (retry hint), so `colab claims`
+shows a `⚠` instead of the claim silently vanishing while GitHub still shows `in-progress`. Retry
+with `colab release <N>`.
+
 ### 3. Tie-break — settling a true simultaneous race
 
 GitHub has no atomic check-and-set on labels/assignees, so two sessions can both pass the refusal

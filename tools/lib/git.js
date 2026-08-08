@@ -246,6 +246,53 @@ function ghCurrentLogin() {
   return _ghLogin;
 }
 
+/** Raw `gh api` call — returns {ok, stdout, stderr, code}. cwd must be inside the repo so `{owner}`
+ * / `{repo}` placeholders resolve to the right remote. */
+function ghApi(repo, args) {
+  return run('gh', ['api', ...args], { cwd: repo });
+}
+
+/**
+ * True when a gh CLI failure is specifically a GraphQL quota exhaustion, not a REST one (#164).
+ * `gh` prefixes every GraphQL-transport error with a literal `GraphQL:` on the first line of
+ * stderr (its own reporting convention, not something we control) — so this is the one reliable
+ * signal that the failing write went over GraphQL rather than REST. REST and GraphQL are counted
+ * as SEPARATE hourly quotas, so this failure says nothing about whether the REST equivalent below
+ * can still complete — that is the entire reason a fallback is worth attempting.
+ */
+function isGraphqlRateLimit(stderr) {
+  const first = String(stderr || '').split('\n')[0] || '';
+  return /^GraphQL:/i.test(first) && /rate limit/i.test(first);
+}
+
+/**
+ * Release an issue's tracker claim — unassign `@me` + remove the `in-progress` label. Primary
+ * path is `gh issue edit` (GraphQL, one mutation for both). On a GraphQL-specific rate limit
+ * (#164) it retries each half over REST instead, since the two quotas are independent:
+ *   DELETE /repos/{owner}/{repo}/issues/{n}/labels/in-progress
+ *   DELETE /repos/{owner}/{repo}/issues/{n}/assignees   (body: {assignees:[login]})
+ * Any other kind of failure (network down, issue not found, ...) is NOT retried — a GraphQL
+ * rate limit is the one case where "try a different transport" is actually a different question,
+ * not a repeat of the same one. Returns {ok, stderr} in the same shape ghIssueEdit already returns.
+ */
+function ghIssueRelease(repo, issueNum) {
+  const r = run('gh', ['issue', 'edit', String(issueNum), '--remove-assignee', '@me', '--remove-label', 'in-progress'], { cwd: repo });
+  if (r.ok || !isGraphqlRateLimit(r.stderr)) return r;
+
+  const label = ghApi(repo, ['-X', 'DELETE', `repos/{owner}/{repo}/issues/${issueNum}/labels/in-progress`]);
+  const login = ghCurrentLogin();
+  const assignee = login
+    ? ghApi(repo, ['-X', 'DELETE', `repos/{owner}/{repo}/issues/${issueNum}/assignees`, '-f', `assignees[]=${login}`])
+    : { ok: false, stderr: 'could not resolve current gh login for assignee removal (gh api user failed)' };
+
+  const ok = label.ok && assignee.ok;
+  const stderr = ok ? '' : [
+    !label.ok && `label removal: ${label.stderr.split('\n')[0] || label.code}`,
+    !assignee.ok && `assignee removal: ${assignee.stderr.split('\n')[0] || assignee.code}`,
+  ].filter(Boolean).join('; ');
+  return { ok, stderr, code: ok ? 0 : 1 };
+}
+
 /**
  * `gh issue view N --json <fields>` → parsed object, or null on any failure (gh missing,
  * bad repo, network, unparseable). Callers treat null as "couldn't read" — never as "empty".
@@ -257,9 +304,16 @@ function ghIssueView(repo, issueNum, fields) {
   catch (_) { return null; }
 }
 
-/** Post a comment on an issue — returns {ok, stderr}. Best-effort at the call sites. */
+/**
+ * Post a comment on an issue — returns {ok, stderr}. Best-effort at the call sites. Primary path
+ * is `gh issue comment` (GraphQL); on a GraphQL-specific rate limit (#164) it retries once over
+ * the REST equivalent (`POST /repos/{owner}/{repo}/issues/{n}/comments`) — a separate quota, so a
+ * GraphQL exhaustion says nothing about whether this can still land.
+ */
 function ghIssueComment(repo, issueNum, body) {
-  return run('gh', ['issue', 'comment', String(issueNum), '--body', body], { cwd: repo });
+  const r = run('gh', ['issue', 'comment', String(issueNum), '--body', body], { cwd: repo });
+  if (r.ok || !isGraphqlRateLimit(r.stderr)) return r;
+  return ghApi(repo, ['-X', 'POST', `repos/{owner}/{repo}/issues/${issueNum}/comments`, '-f', `body=${body}`]);
 }
 
 /**
@@ -408,4 +462,5 @@ module.exports = {
   ghAvailable, ghIssueEdit, ghListLabels, ghAssignedIssues,
   ghCurrentLogin, ghIssueView, ghIssueComment, ghRunForSha, ghRunJobCount,
   ghIssueListByLabel, ghLabelDelete,
+  ghApi, isGraphqlRateLimit, ghIssueRelease,
 };

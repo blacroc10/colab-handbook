@@ -556,35 +556,49 @@ function cmdRelease(argv) {
   const num = normIssueNum(opts._[0]);
   const repoAbs = opts.repo ? resolveRepo(opts) : (git.repoRoot(process.cwd()) || null);
 
-  let found;
-  const out = state.mutate((st) => {
-    found = findClaim(st, num, repoAbs);
-    if (!found) return null;
-    delete st.claims[found.key];
-    const wtName = found.claim.worktree;
-    let remaining = null;
-    if (wtName) {
-      remaining = Object.values(st.claims).filter((c) => c.worktree === wtName).length;
+  // #164: look the claim up WITHOUT deleting it yet — the gh write below can fail (GraphQL AND
+  // REST both rate-limited, network down, ...), and deleting first would clear the one local
+  // record that lets a subsequent retry find this claim again (the same failure mode `colab ship`
+  // hit; `colab release` is the retry path for a claim it left `releasePending`).
+  const st0 = state.loadState();
+  const found = findClaim(st0, num, repoAbs);
+  if (!found) throw new UserError(`No local claim for #${num}` + (repoAbs ? ` in ${shortRepo(repoAbs)}` : ''));
+  const repo = found.claim.repo;
+  const wtName = found.claim.worktree;
+
+  let ghFailed = false;
+  if (isGhUsable(repo)) {
+    const r = git.ghIssueRelease(repo, num); // GraphQL primary, REST fallback on a GraphQL rate limit (#164)
+    if (r.ok) {
+      print(`  gh: #${num} unassigned + label removed`);
+    } else {
+      ghFailed = true;
+      warn(`gh edit #${num} failed on both GraphQL and REST (${r.stderr.split('\n')[0] || r.code}) — local claim KEPT (releasePending) so a retry can find it`);
     }
-    return { repo: found.claim.repo, wtName, remaining };
-  });
-
-  if (!out) throw new UserError(`No local claim for #${num}` + (repoAbs ? ` in ${shortRepo(repoAbs)}` : ''));
-
-  if (isGhUsable(out.repo)) {
-    const r = git.ghIssueEdit(out.repo, num, ['--remove-assignee', '@me', '--remove-label', 'in-progress']);
-    if (r.ok) print(`  gh: #${num} unassigned + label removed`);
-    else warn(`gh edit #${num} failed (${r.stderr.split('\n')[0] || r.code}) — local claim already removed`);
-    postReleaseComment(out.repo, num); // "✅ Released" unless the issue is already CLOSED
+    postReleaseComment(repo, num); // "✅ Released" unless the issue is already CLOSED
   } else {
     warn('gh not usable here — released LOCAL-ONLY');
   }
-  print(`Released #${num} from ${shortRepo(out.repo)}`);
-  pushEvent('release', { repo: out.repo, issue: num, worktree: out.wtName, session: found.claim.session });
-  if (out.wtName && out.remaining === 0) {
-    print(`  note: worktree "${out.wtName}" now has ZERO claims (not removed — run: colab worktree rm ${out.wtName})`);
-  } else if (out.wtName) {
-    print(`  worktree "${out.wtName}" still has ${out.remaining} claim(s)`);
+
+  let remaining = null;
+  state.mutate((st) => {
+    const c = st.claims[found.key];
+    if (!c) return; // shouldn't happen — we just read it above
+    if (ghFailed) {
+      c.releasePending = true;
+      c.releaseNote = `GitHub release failed (${nowISO()}) — retry with: colab release ${num}`;
+    } else {
+      delete st.claims[found.key];
+      if (wtName) remaining = Object.values(st.claims).filter((cl) => cl.worktree === wtName).length;
+    }
+  });
+
+  print(ghFailed ? `Release of #${num} recorded locally as PENDING (GitHub write failed — see above)` : `Released #${num} from ${shortRepo(repo)}`);
+  pushEvent('release', { repo, issue: num, worktree: wtName, session: found.claim.session });
+  if (!ghFailed && wtName && remaining === 0) {
+    print(`  note: worktree "${wtName}" now has ZERO claims (not removed — run: colab worktree rm ${wtName})`);
+  } else if (!ghFailed && wtName) {
+    print(`  worktree "${wtName}" still has ${remaining} claim(s)`);
   }
   return 0;
 }
@@ -1501,8 +1515,14 @@ function cmdClaims(argv) {
     const wt = st.worktrees[g];
     const portStr = wt && wt.ports.length ? ` ports:${wt.ports.join(',')}` : '';
     print(`\n▸ ${g}${portStr}`);
-    const rows = cs.map((c) => [c.issue, shortRepo(c.repo), c.branch || '-', c.host, identityCell(c.sessionName, c.session), c.created.slice(0, 10)]);
+    // #164: a claim left `releasePending` means the GitHub write failed (rate limit/network) —
+    // it is NOT a normal live claim, so say so inline instead of it reading identically to one.
+    const rows = cs.map((c) => [
+      c.issue + (c.releasePending ? ' ⚠' : ''), shortRepo(c.repo), c.branch || '-', c.host,
+      identityCell(c.sessionName, c.session), c.created.slice(0, 10),
+    ]);
     print(table(rows, ['ISSUE', 'REPO', 'BRANCH', 'HOST', 'SESSION', 'SINCE']).split('\n').map((l) => '  ' + l).join('\n'));
+    for (const c of cs) if (c.releasePending) print(`  ⚠ #${c.issue}: ${c.releaseNote || 'release pending — GitHub write failed'}`);
     identityLegend(cs);
   }
   return 0;
@@ -2191,27 +2211,48 @@ function cmdWorktreeRm(argv) {
   // #114: the label/assignee write goes through the same API as everything else here and can fail
   // for a reason that has nothing to do with the issue (rate limit, network) — track it per issue
   // instead of assuming it landed just because the LOCAL claim record is about to be dropped below.
+  // #164: `ghIssueRelease` retries over REST on a GraphQL-specific rate limit (a separate quota),
+  // so this only reports `trackerFailed` for a write that failed on BOTH transports.
   const gh = isGhUsable(repoAbs);
   const trackerFailed = [];
   for (const num of attachedIssues) {
     if (gh) {
-      const r = git.ghIssueEdit(repoAbs, num, ['--remove-assignee', '@me', '--remove-label', 'in-progress']);
+      const r = git.ghIssueRelease(repoAbs, num);
       if (!r.ok) {
-        warnDeferred(`could not release tracker claim on #${num} (${r.stderr.split('\n')[0] || r.code}) — GitHub still shows in-progress; local claim record cleared regardless`);
+        warnDeferred(`could not release tracker claim on #${num} (${r.stderr.split('\n')[0] || r.code}) — GitHub still shows in-progress; local claim record KEPT (not cleared) so a retry can find it`);
         trackerFailed.push(num);
       }
       postReleaseComment(repoAbs, num);
     }
   }
 
-  // state: drop claims, ports, worktree
+  // state: drop claims, ports, worktree.
+  // #164: a claim whose remote release just failed is deliberately NOT deleted here — clearing it
+  // would leave GitHub and the local registry disagreeing in the one direction that reads as
+  // healthy (no local claim, no worktree, but the issue still shows in-progress on GitHub). The
+  // kept record has no worktree behind it once `st.worktrees[name]` is dropped below — the same
+  // shape `code-sweep` already recognises as a "claim-only" candidate, so a later sweep or a
+  // `colab claims` listing surfaces it instead of it vanishing into scrollback (self-describing
+  // residue: `releasePending` + `releaseNote` say WHY it's still there, not just THAT it is).
+  const trackerFailedSet = new Set(trackerFailed);
   const removed = state.mutate((st) => {
     const claims = Object.keys(st.claims).filter((k) => st.claims[k].worktree === name);
-    for (const k of claims) delete st.claims[k];
+    let deleted = 0;
+    for (const k of claims) {
+      const c = st.claims[k];
+      if (gh && trackerFailedSet.has(normIssueNum(c.issue))) {
+        c.worktree = null; // the worktree it pointed to is gone below — don't leave a dangling ref
+        c.releasePending = true;
+        c.releaseNote = `GitHub release failed at worktree rm (${nowISO()}) — retry with: colab release ${normIssueNum(c.issue)}`;
+        continue;
+      }
+      delete st.claims[k];
+      deleted++;
+    }
     const freedPorts = Object.keys(st.ports).filter((p) => st.ports[p].owner.type === 'worktree' && st.ports[p].owner.ref === name);
     for (const p of freedPorts) delete st.ports[p];
     delete st.worktrees[name];
-    return { claims: claims.length, freedPorts };
+    return { claims: deleted, freedPorts };
   });
 
   print(`✓ Removed worktree "${name}"`);
@@ -2223,7 +2264,7 @@ function cmdWorktreeRm(argv) {
   print(`  released ${gh ? `${trackerReleased}/${attachedIssues.length}` : removed.claims} claim(s)` +
     `${attachedIssues.length ? ' (' + attachedIssues.map((n) => '#' + n).join(' ') + ')' : ''}` +
     `${gh ? '' : ' (local-only)'}` +
-    `${trackerFailed.length ? ` — FAILED on ${trackerFailed.map((n) => '#' + n).join(', ')}: GitHub still shows in-progress there; local claim record was cleared regardless` : ''}`);
+    `${trackerFailed.length ? ` — FAILED on ${trackerFailed.map((n) => '#' + n).join(', ')}: GitHub still shows in-progress there; local claim record KEPT (releasePending) — retry with: colab release <N>` : ''}`);
   if (killed.length) print(`  stopped ${killed.filter((k) => k.gone).length}/${killed.length} owned process(es): ${killed.map((k) => k.pid).join(', ')}`);
 
   // "freed" must mean freed. Reporting a port as free while something still answers on it is what

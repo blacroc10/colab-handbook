@@ -308,3 +308,147 @@ test('gh failing returns null, distinct from "no runs for this sha"', () => {
   const result = fx.withFailingGh(() => git.ghRunForSha(fx.work, 'main'));
   assert.strictEqual(result, null);
 });
+
+// --- GraphQL rate-limit → REST fallback (#164) -----------------------------
+//
+// `colab ship`'s post-merge writes (release the tracker claim, post the release comment, post the
+// ship comment) all go through `gh issue edit`/`gh issue comment`, which is GraphQL under the
+// hood — so a GraphQL-only quota exhaustion took out all three at once even though REST `core`
+// still had budget (verified by hand on the same token, in the same minute, per the issue). The
+// fix is a same-transport-first, REST-on-rate-limit-only fallback: `isGraphqlRateLimit` reads the
+// `GraphQL:`-prefixed stderr line `gh` itself produces on that specific failure, and
+// `ghIssueComment`/`ghIssueRelease` retry over `gh api` only when that reads true — never on a
+// generic failure (network down, bad issue number, ...), where retrying a different transport
+// would just be masking a real error as if it were a quota problem.
+//
+// A dispatching fake `gh` (not the fixed-JSON one above) is needed here because these functions
+// make MULTIPLE distinct calls in sequence (GraphQL attempt, then a REST attempt per sub-write) —
+// the fixture's single-response stub can't represent that. `FAKE_GH_BEHAVIOR` selects the canned
+// outcome per call shape; `FAKE_GH_CALLS` (one JSON array of argv per line) is asserted against so
+// a test can tell WHICH transport actually got called, not just the final return value.
+
+function ghFallbackFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'colab-ghfallback-'));
+  TMP.push(root);
+  const bin = path.join(root, 'bin');
+  fs.mkdirSync(bin);
+  const callsFile = path.join(root, 'calls.jsonl');
+  fs.writeFileSync(callsFile, '');
+
+  const script = `#!/usr/bin/env node
+const fs = require('fs');
+const args = process.argv.slice(2);
+if (process.env.FAKE_GH_CALLS) fs.appendFileSync(process.env.FAKE_GH_CALLS, JSON.stringify(args) + '\\n');
+const behavior = process.env.FAKE_GH_BEHAVIOR || 'ok';
+function fail(msg) { process.stderr.write(msg + '\\n'); process.exit(1); }
+function ok(out) { if (out) process.stdout.write(out); process.exit(0); }
+const isGraphqlOp = (args[0] === 'issue' && (args[1] === 'comment' || args[1] === 'edit'));
+const isApi = args[0] === 'api';
+if (isGraphqlOp) {
+  if (behavior === 'graphql-rate-limit-then-rest-ok' || behavior === 'graphql-rate-limit-both-fail') {
+    return fail('GraphQL: API rate limit exceeded for installation ID 123. (' + (args[1] === 'comment' ? 'addComment' : 'updateIssue') + ')');
+  }
+  if (behavior === 'generic-fail') return fail('HTTP 404: Not Found');
+  return ok();
+}
+if (isApi && args.includes('user')) return ok('octofake\\n');
+if (isApi) {
+  if (behavior === 'graphql-rate-limit-both-fail') return fail('HTTP 403: API rate limit exceeded (rest)');
+  return ok();
+}
+fail('fake gh: unhandled invocation ' + JSON.stringify(args));
+`;
+  fs.writeFileSync(path.join(bin, 'gh'), script, { mode: 0o755 });
+
+  function withBehavior(behavior, fn) {
+    fs.writeFileSync(callsFile, '');
+    const prevPath = process.env.PATH;
+    const prevBehavior = process.env.FAKE_GH_BEHAVIOR;
+    const prevCalls = process.env.FAKE_GH_CALLS;
+    process.env.PATH = `${bin}:${prevPath}`;
+    process.env.FAKE_GH_BEHAVIOR = behavior;
+    process.env.FAKE_GH_CALLS = callsFile;
+    try { return fn(); }
+    finally {
+      process.env.PATH = prevPath;
+      if (prevBehavior === undefined) delete process.env.FAKE_GH_BEHAVIOR; else process.env.FAKE_GH_BEHAVIOR = prevBehavior;
+      if (prevCalls === undefined) delete process.env.FAKE_GH_CALLS; else process.env.FAKE_GH_CALLS = prevCalls;
+    }
+  }
+
+  function calls() {
+    return fs.readFileSync(callsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  }
+
+  return { repo: root, withBehavior, calls };
+}
+
+test('isGraphqlRateLimit: true only for a GraphQL-prefixed rate-limit line', () => {
+  assert.strictEqual(git.isGraphqlRateLimit('GraphQL: API rate limit exceeded for installation ID 123. (addComment)'), true);
+  assert.strictEqual(git.isGraphqlRateLimit('HTTP 403: API rate limit exceeded (rest)'), false, 'a REST rate limit is not a GraphQL one');
+  assert.strictEqual(git.isGraphqlRateLimit('GraphQL: Something else went wrong. (addComment)'), false, 'GraphQL failure that is not a rate limit');
+  assert.strictEqual(git.isGraphqlRateLimit(''), false);
+  assert.strictEqual(git.isGraphqlRateLimit(undefined), false);
+});
+
+test('ghIssueComment: GraphQL succeeds → posts once, never touches REST', () => {
+  const fx = ghFallbackFixture();
+  const r = fx.withBehavior('ok', () => git.ghIssueComment(fx.repo, 164, 'hello'));
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(fx.calls().length, 1);
+  assert.deepStrictEqual(fx.calls()[0].slice(0, 2), ['issue', 'comment']);
+});
+
+test('ghIssueComment: GraphQL rate-limited → falls back to REST and succeeds', () => {
+  const fx = ghFallbackFixture();
+  const r = fx.withBehavior('graphql-rate-limit-then-rest-ok', () => git.ghIssueComment(fx.repo, 164, 'hello'));
+  assert.strictEqual(r.ok, true, r.stderr);
+  const calls = fx.calls();
+  assert.strictEqual(calls.length, 2, 'GraphQL attempt then one REST retry');
+  assert.deepStrictEqual(calls[0].slice(0, 2), ['issue', 'comment']);
+  assert.strictEqual(calls[1][0], 'api');
+  assert.ok(calls[1].some((a) => String(a).includes('/issues/164/comments')), 'hit the REST comments endpoint');
+});
+
+test('ghIssueComment: a non-rate-limit GraphQL failure is NOT retried over REST', () => {
+  const fx = ghFallbackFixture();
+  const r = fx.withBehavior('generic-fail', () => git.ghIssueComment(fx.repo, 164, 'hello'));
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(fx.calls().length, 1, 'no REST fallback attempted for an unrelated error');
+});
+
+test('ghIssueRelease: GraphQL succeeds → one call, both label+assignee in it', () => {
+  const fx = ghFallbackFixture();
+  const r = fx.withBehavior('ok', () => git.ghIssueRelease(fx.repo, 164));
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(fx.calls().length, 1);
+  assert.deepStrictEqual(fx.calls()[0].slice(0, 2), ['issue', 'edit']);
+});
+
+test('ghIssueRelease: GraphQL rate-limited → REST label delete + REST assignee delete both succeed', () => {
+  const fx = ghFallbackFixture();
+  const r = fx.withBehavior('graphql-rate-limit-then-rest-ok', () => git.ghIssueRelease(fx.repo, 164));
+  assert.strictEqual(r.ok, true, r.stderr);
+  const calls = fx.calls();
+  // GraphQL attempt, then `gh api user` to resolve the login, then the two REST deletes.
+  assert.deepStrictEqual(calls[0].slice(0, 2), ['issue', 'edit']);
+  const apiCalls = calls.slice(1).filter((c) => c[0] === 'api');
+  assert.ok(apiCalls.some((c) => c.includes('user')), 'resolved the login via gh api user');
+  assert.ok(apiCalls.some((c) => c.some((a) => String(a).includes('/labels/in-progress'))), 'deleted the label over REST');
+  assert.ok(apiCalls.some((c) => c.some((a) => String(a).includes('/assignees'))), 'removed the assignee over REST');
+});
+
+test('ghIssueRelease: rate-limited on GraphQL AND REST → fails, reporting both sub-writes', () => {
+  const fx = ghFallbackFixture();
+  const r = fx.withBehavior('graphql-rate-limit-both-fail', () => git.ghIssueRelease(fx.repo, 164));
+  assert.strictEqual(r.ok, false);
+  assert.match(r.stderr, /label removal/);
+  assert.match(r.stderr, /assignee removal/);
+});
+
+test('ghIssueRelease: a non-rate-limit GraphQL failure is NOT retried over REST', () => {
+  const fx = ghFallbackFixture();
+  const r = fx.withBehavior('generic-fail', () => git.ghIssueRelease(fx.repo, 164));
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(fx.calls().length, 1, 'no REST fallback attempted for an unrelated error');
+});
