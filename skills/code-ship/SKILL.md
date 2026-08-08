@@ -142,9 +142,53 @@ before touching `<base>`. Skip if `<base>` hasn't moved since you branched
 ```sh
 git fetch origin <base>
 git merge origin/<base>        # conflicts in generated files → the regen below overwrites them
-# then re-run the repo's codegen on the merged base, e.g. npm run build / codegen
+```
+
+**Check what the merge actually did before touching anything else — do not chain
+straight into `add -A && commit` (#123).** `git merge` failing with **zero**
+conflicted paths is not a conflict to resolve; it is the merge never having
+applied (transient index-lock contention is the measured cause). Both that case
+and a real, resolved conflict leave `MERGE_HEAD` set and look identical to every
+cheap check afterwards — parent count, `merge-base --is-ancestor`, even a green
+gate, since a tree that lost `<base>`'s newer work is still perfectly
+self-consistent. Only the diff against `<base>` tells the two apart:
+
+```sh
+git diff --name-only --diff-filter=U        # unmerged paths right now
+```
+
+- **Non-empty** → real conflicts. Resolve them (generated files: regen below;
+  anything else: read the region, see the incident in this file's history),
+  `git add` the resolved paths, then commit explicitly — never `add -A` blind,
+  it will also stage unrelated working-tree cruft into the merge commit.
+- **Empty, and `git merge` reported failure** → the merge never ran. **Do not
+  commit.** Fix the transient cause (retry after the index lock clears, `git
+  merge --abort` first if `MERGE_HEAD` is stuck) and re-run `git merge
+  origin/<base>` from a clean state. Committing here manufactures a two-parent
+  merge whose tree is the branch's pre-merge tree — a merge commit that reads as
+  "synced with `<base>`" while silently reverting everything `<base>` had that
+  the branch didn't.
+
+Then re-run the repo's codegen on the merged base (e.g. `npm run build` /
+codegen) if the repo has one, and commit:
+
+```sh
 git add -A && git commit -m "chore(sync): merge <base> + regen generated files"
 ```
+
+**Before the gate, assert the merge actually incorporated `<base>` — a green
+gate is not evidence of this, only of self-consistency:**
+
+```sh
+git diff --stat origin/<base> HEAD
+```
+
+This must show **only this branch's own files**. Deletions of files the branch
+never touched — especially other issues' shipped code, or `CLAUDE.md` Status
+entries — mean the sync commit above was the false-merge shape despite the
+guard: stop, do not proceed to the gate or the ship, and re-derive the merge
+from a fresh `git merge --abort` + retry rather than trying to patch the bad
+commit.
 
 Re-run the gate (`code-wrap` A3) — a fresh-migrate test must pass, proving both branches'
 migrations run clean together. *(Machine-specific reconcile — e.g. deduping a
