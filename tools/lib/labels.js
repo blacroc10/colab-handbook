@@ -25,18 +25,31 @@
  * other three met; contrast `TRACKING_LABEL` below, which stays opt-in because nothing
  * unattended reads it (yet).
  *
- * `needs-ruling` joined the set in #75: a designer producing a spec decides whether the
- * surface needs a human pre-approval before code starts, and marks the issue so — a
- * readiness gate exactly like an open hard blocker or `in-progress`, not a softer
- * advisory. Absent this label a repo cannot apply that gate at all, and a surface nobody
- * has ruled on reads as a normal start candidate to a human session or a scheduled driver
- * alike (CONVENTIONS.md §5, *Design ruling*). It joins CONVENTION_LABELS for the same
- * reason `epic` did: an unattended decision (a scheduler's start-or-skip) depends on it.
+ * `needs-decision` (named `needs-ruling` before #122) joined the set in #75: a human must
+ * answer a blocking question before this issue can start — originally scoped to a
+ * designer's pre-approval, widened by #122 to the whole family a gate this shape actually
+ * covers (a design ruling, a business-logic call, a permission), because "ruling" read
+ * narrower than the gate. A readiness gate exactly like an open hard blocker or
+ * `in-progress`, not a softer advisory. Absent this label a repo cannot apply that gate at
+ * all, and a surface nobody has ruled on reads as a normal start candidate to a human
+ * session or a scheduled driver alike (CONVENTIONS.md §5, *Decision gate*). It joins
+ * CONVENTION_LABELS for the same reason `epic` did: an unattended decision (a scheduler's
+ * start-or-skip) depends on it.
+ *
+ * `decision-recorded` joined the set in #121, alongside the same rename: clearing
+ * `needs-decision` is not by itself evidence a human answered — a gate cleared by hand and
+ * a gate never applied read identically to a later reader, and #127 measured exactly that
+ * failure (a ruling sat live in a comment; a later triage pass, seeing no label, re-gated
+ * the issue). So recording a ruling is now a POSITIVE, machine-readable act — a
+ * `⚖ Decision recorded` comment (tools/lib/decision-record.js) plus this label, written
+ * together — never the mere absence of `needs-decision`. A consumer checking readiness
+ * must look for this label (or the live marker) before re-applying the gate, not just for
+ * the gate's absence.
  *
  * `needs-plan` joined the set in #94: `code-triage` flags an issue it judges genuinely
  * hard — ambiguous scope, a novel design with no repo precedent, a coupling wider than
  * file overlap — and `code-start` reads the flag to decide whether to run `code-plan`
- * before coding, rather than the default 3-5-line stub. Unlike `needs-ruling` it is NOT a
+ * before coding, rather than the default 3-5-line stub. Unlike `needs-decision` it is NOT a
  * readiness gate — a flagged issue is still startable now, it just should not go straight
  * to code (CONVENTIONS.md §5, *Planning*). It is provisioned like the rest of this set,
  * not created on demand the way `group:<key>` is, because its name is fixed and every
@@ -48,8 +61,8 @@
  * entire deliverable IS a schema change (CONVENTIONS.md §5, *Migration exemption*). `colab ship`
  * reads it, on EVERY issue a branch carries, when — and only when — that branch touches a
  * migration path; absence is the ordinary, unexempted case and costs nothing. Its nearest
- * neighbour is `needs-ruling`, and the two point opposite directions: `needs-ruling` *blocks* a
- * start pending a human review of the design; `migration-granted` *unblocks* a ship because a
+ * neighbour is `needs-decision`, and the two point opposite directions: `needs-decision` *blocks* a
+ * start pending a human answer; `migration-granted` *unblocks* a ship because a
  * human already reviewed the schema change. It joins `CONVENTION_LABELS` rather than staying
  * repo-opt-in like `tracking`/`graph-empty` because its absence fails MALIGNANTLY, not benignly:
  * a repo that adopted before this label existed cannot create a grant at all, so the schema-
@@ -88,7 +101,7 @@
  * unlabelled the day this lands, so absence collapsing into "non-code" would freeze the start
  * gate for everyone on day one. `delivery:code` is the explicit affirmative for a code issue;
  * `content` / `ops` / `docs-only` are the explicit non-code types, which triage and the readiness
- * gate treat as route-not-start — a companion to the `epic` rule and the `needs-ruling` gate, not
+ * gate treat as route-not-start — a companion to the `epic` rule and the `needs-decision` gate, not
  * a merge of either. It joins `CONVENTION_LABELS` for the same reason `epic` did: an unattended
  * decision (a scheduler's or triage's start-or-skip) depends on being able to tell the three
  * states apart, and a repo that adopted before this set existed cannot create the label at all —
@@ -100,7 +113,8 @@ const CONVENTION_LABELS = [
   { name: 'deps-checked', color: '0E8A16', description: 'Dependencies verified — no open blocker' },
   { name: 'agent-filed', color: 'C5DEF5', description: 'Filed by an agent on its own initiative — not human-approved' },
   { name: 'epic', color: '3E4B9E', description: 'Container for sub-issues — informative, never a start candidate, never claimed as a unit of work' },
-  { name: 'needs-ruling', color: 'B60205', description: 'Needs a human design ruling before this can start' },
+  { name: 'needs-decision', color: 'B60205', description: 'A human must answer a blocking question before this can start' },
+  { name: 'decision-recorded', color: '006B75', description: 'A human answered here — read the ⚖ Decision comment before re-applying needs-decision' },
   { name: 'needs-plan', color: '0052CC', description: 'Triage judged this hard — code-start should run code-plan before coding' },
   { name: 'migration-granted', color: 'D93F0B', description: "A human granted this issue's branch an exemption from ship's no-new-migrations gate" },
   { name: 'ci-granted', color: 'D73A4A', description: "A human granted this branch a one-shot exemption from ship's trunk-CI-green gate" },
@@ -296,6 +310,30 @@ function ciGrantMissingLabelHint(present) {
     + `handbook-sync (§7) to create the convention label set, then re-run the command.`;
 }
 
+// The decision-gate marker, named once (#75, renamed #122). CONVENTIONS.md §5 (Decision gate)
+// is the prose source; `colab decision`, code-triage's readiness check, and the provisioner
+// all read the name from HERE — the identical reason READINESS_LABEL is a shared constant.
+const NEEDS_DECISION_LABEL = 'needs-decision';
+
+// The positive decision-record marker, named once (#121). Paired with NEEDS_DECISION_LABEL:
+// clearing the gate and recording the answer are ONE act (`colab decision --record`), never
+// two — see the doc comment above CONVENTION_LABELS for why a cleared gate alone is not
+// evidence anything was answered.
+const DECISION_RECORDED_LABEL = 'decision-recorded';
+
+// Same diagnosis as migrationGrantMissingLabelHint, for the decision-recorded marker (#121): a
+// repo that adopted before this label entered the set has no such label, so `colab decision
+// --record` cannot apply it. Same two-null contract as the others: `present` null means the
+// read itself failed (fall back to the raw gh error), the label being present means the ADD
+// failed for some other reason — this function is not the one to explain that.
+function decisionRecordedMissingLabelHint(present) {
+  if (!present) return null;
+  if (!missingConventionLabels(present).includes(DECISION_RECORDED_LABEL)) return null;
+  return `this repo has no \`${DECISION_RECORDED_LABEL}\` label, so a decision cannot be recorded — it `
+    + `adopted the conventions before that label entered the set and never back-filled it. Run `
+    + `handbook-sync (§7) to create the convention label set, then re-run the command.`;
+}
+
 // The GROUP label prefix (CONVENTIONS.md §5, Grouping). `group:<key>` records that a set of
 // issues must share one branch — the key is the branch slug minus its trailing issue numbers.
 // Deliberately NOT in CONVENTION_LABELS: it is per-group (one label PER key, not one fixed
@@ -332,6 +370,7 @@ module.exports = {
   MECHANICAL_READINESS_LABEL, mechanicalReadinessLabelArgs,
   MIGRATION_GRANT_LABEL, migrationGrantLabelArgs, migrationGrantMissingLabelHint,
   CI_GRANT_LABEL, ciGrantLabelArgs, ciGrantMissingLabelHint,
+  NEEDS_DECISION_LABEL, DECISION_RECORDED_LABEL, decisionRecordedMissingLabelHint,
   GROUP_LABEL_PREFIX, isGroupLabel, groupLabelNames,
   DELIVERY_LABEL_PREFIX, NON_CODE_DELIVERY_TYPES, deliveryType, isRouteNotStart,
 };

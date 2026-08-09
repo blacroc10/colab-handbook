@@ -596,11 +596,19 @@ with the blocker named:
       finding — do not narrate it in the report, and do not let it vary the
       per-beat verdict when the only thing that moved was an unrelated worktree.
       Report contention only when there is a real path overlap, and name it.
-- [ ] **No pending design ruling** — no `needs-ruling` label (`CONVENTIONS.md` §5,
-      *Design ruling*). A design surface awaiting human pre-approval is not a start
-      candidate for anyone, manual or scheduled, until a human clears the label —
-      report it exactly as any other blocker, naming the label as what must be
-      cleared and by whom.
+- [ ] **No pending decision** — no `needs-decision` label (`CONVENTIONS.md` §5,
+      *Decision gate*). A surface awaiting a human answer is not a start candidate
+      for anyone, manual or scheduled, until the decision is recorded — report it
+      exactly as any other blocker, naming the label as what must be cleared and by
+      whom.
+      **Before re-applying `needs-decision` to an issue that already lacks it,
+      check for a live `⚖ Decision recorded` comment or a `decision-recorded`
+      label first.** A cleared gate with no positive record present is the
+      unswept-but-genuinely-open state; a cleared gate WITH one of those present
+      means the question was already answered — re-gating it reproduces a measured
+      failure (#127: a ruling sat live in a comment, a triage pass saw no label and
+      re-gated settled work). `colab decision --list` shows every issue with a live
+      decision right now.
 - [ ] **Delivery type is code, or not asked** — no `delivery:content` / `delivery:ops` /
       `delivery:docs-only` label (`CONVENTIONS.md` §5, *Delivery type*). This issue was
       already filtered out at §2 if it carries one; this bullet is the reminder for a
@@ -783,7 +791,7 @@ session working only this issue would not see from where you are sitting>"
 - **Idempotent, same as §3's group evidence (§0.2).** The label add is naturally
   idempotent; grep existing comments for `needs-plan:` before posting a second reason —
   re-post only if the reason actually changed, and say what changed.
-- **Not a readiness gate.** Unlike `needs-ruling` (§5), this label never blocks a group
+- **Not a readiness gate.** Unlike `needs-decision` (§5), this label never blocks a group
   from being reported ready. It only tells the session that starts it to plan before
   coding — the group is still startable now.
 - **Most groups get nothing.** The label is for the minority genuinely judged hard. A

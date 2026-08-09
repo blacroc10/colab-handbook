@@ -447,7 +447,7 @@ consistent with the existing icon set. Flagging for review.
 \`app/Views/EmptyState.tsx:12\` — added the illustration and copy."
 ```
 
-This is the human-review path for a design decision the `needs-ruling` gate did not
+This is the human-review path for a design decision the `needs-decision` gate did not
 catch because nobody could have: the surface did not look significant until someone was
 already building it. The session does not stop to request a ruling first — it continues
 on the designer's spec and lets the evidence comment carry the flag instead.

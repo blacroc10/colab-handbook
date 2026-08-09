@@ -30,6 +30,7 @@ const checklist = require('./lib/checklist');
 const groupLabels = require('./lib/group-labels');
 const shipguard = require('./lib/shipguard');
 const migrationGrant = require('./lib/migration-grant');
+const decisionRecord = require('./lib/decision-record');
 const ciGrant = require('./lib/ci-grant');
 const ciVerdict = require('./lib/ci-verdict');
 const {
@@ -1168,6 +1169,219 @@ function cmdMigrationGrantList(opts) {
   if (stale.length) {
     print('');
     for (const n of stale) warn(`#${n} carries the ${labels.MIGRATION_GRANT_LABEL} label but has NO live grant comment — stale state, looks owned and joins to nothing. Revoke or re-grant.`);
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// decision (#121, #122) — record a human's answer to a blocking `needs-decision` question as a
+// POSITIVE, machine-readable act, never as the label's mere absence. See tools/lib/decision-
+// record.js for the verdict logic and CONVENTIONS.md §5 (Decision gate) for the full design.
+// This section is the gh I/O only.
+// ---------------------------------------------------------------------------
+
+const HELP_DECISION = `colab decision <issue> --record --ruled-by <name> [--answers <ref>] [--body-file <f>] [--repo P]
+colab decision <issue> --reopen --ruled-by <name> [--body-file <f>] [--repo P]
+colab decision --list [--json] [--repo P]
+
+Own the decision-record marker (#121) — the fix for a measured failure (#127): a ruling posted
+as ordinary prose, with the \`${labels.NEEDS_DECISION_LABEL}\` label removed by hand, is
+indistinguishable to a later reader from a question nobody ever answered. A cleared label reads
+identically to a label never applied, so a later triage pass re-gated a settled issue.
+
+  colab decision <N> --record --ruled-by <name>    record a decision on #N, clear the gate
+  colab decision <N> --reopen --ruled-by <name>     reopen #N's decision (re-applies the gate)
+  colab decision --list [--json]                    list every issue with a live decision now
+
+--record performs, in this order: (1) posts the \`${decisionRecord.DECISION_MARK}\` comment — the
+ANSWER, the actual artifact a consumer reads — then (2) one \`gh issue edit\` that BOTH removes
+\`${labels.NEEDS_DECISION_LABEL}\` and adds \`${labels.DECISION_RECORDED_LABEL}\`. That order is
+deliberate: a crash between the two steps leaves the record posted and the gate still applied —
+over-blocking, safe and visible — rather than the reverse, which would reproduce #127 exactly
+(gate cleared, no record).
+
+\`--ruled-by\` is REQUIRED and names the human whose call this is — never the typist. This mirrors
+\`Filed-by:\` (CONVENTIONS.md §5, Provenance): the ordinary case is an agent transcribing a ruling
+Boss already made, not inventing one. Unlike \`colab migration-grant\` / \`colab ci-grant\` /
+\`colab promote\`, this command is deliberately NOT gated on COLAB_HUMAN=1 — those three AUTHORIZE
+a write that did not exist before the command ran; this one TRANSCRIBES a decision made elsewhere.
+The safety property is carried by \`--ruled-by\` plus TRUSTED_ASSOCIATIONS on read instead.
+
+\`--answers <ref>\` names the \`<!-- decision:options -->\` comment (id or URL) this decision
+resolves, when one exists — omit it when there was no options block.
+
+Reopening removes \`${labels.DECISION_RECORDED_LABEL}\`, re-applies \`${labels.NEEDS_DECISION_LABEL}\`,
+and posts a \`${decisionRecord.REOPEN_MARK}\` receipt — every decision on that issue up to this
+point is superseded. Not scoped to the original ruler: any trusted account can reopen.
+
+Ask-class \`ruling\` (CONVENTIONS.md §5, Ask) is a DIFFERENT vocabulary — it names why an issue was
+filed, and this command never touches it.
+
+There is deliberately no local-only fallback: without a usable \`gh\`, every subcommand here
+REFUSES rather than write (or read) something invisible to the machine a later triage pass might
+run on.
+
+Options:
+  --record            record a decision (default action when neither --record nor --reopen given
+                       and an issue number is present, for the common one-shot case)
+  --reopen             reopen an existing decision instead of recording a new one
+  --ruled-by <name>    required for --record/--reopen — who made this call, never the typist
+  --answers <ref>      (--record only) the decision:options comment this answers, if any
+  --body-file <f>      ruling prose (or reopen reason) to append below the marker line
+  --list               list every issue with a live decision right now, instead of recording
+  --json               (with --list) machine-readable output
+  --repo <path>        repo root (default: git root of cwd)
+`;
+
+function cmdDecision(argv) {
+  const opts = parseArgs(argv, {
+    values: { '--repo': 'repo', '--ruled-by': 'ruledBy', '--answers': 'answers', '--body-file': 'bodyFile' },
+    flags: { '--record': 'record', '--reopen': 'reopen', '--list': 'list', '--json': 'json', '-h': 'help', '--help': 'help' },
+  });
+  if (opts.help) return print(HELP_DECISION);
+  if (opts.list) return cmdDecisionList(opts);
+  if (opts._.length === 0) return print(HELP_DECISION);
+  const num = normIssueNum(opts._[0]);
+
+  if (!opts.record && !opts.reopen) opts.record = true; // one-shot default — see HELP_DECISION
+
+  if (!opts.ruledBy) {
+    throw new UserError('--ruled-by <name> is required — names the human whose call this is, never the typist (CONVENTIONS.md §5, Provenance)');
+  }
+
+  const repoAbs = opts.repo ? resolveRepo(opts) : (git.repoRoot(process.cwd()) || null);
+  if (!repoAbs) throw new UserError('not inside a git repo — pass --repo <path>');
+
+  if (!isGhUsable(repoAbs)) {
+    throw new UserError('gh not usable here (no gh auth or no origin remote) — a decision record lives on the tracker, visible from any machine to whatever reads it, and there is deliberately no local-only fallback');
+  }
+
+  let body = '';
+  if (opts.bodyFile) {
+    try { body = fs.readFileSync(opts.bodyFile, 'utf8').trim(); }
+    catch (e) { throw new UserError(`could not read --body-file ${opts.bodyFile} (${e.message})`); }
+  }
+
+  return opts.reopen
+    ? cmdDecisionReopen(repoAbs, num, opts, body)
+    : cmdDecisionRecord(repoAbs, num, opts, body);
+}
+
+function cmdDecisionRecord(repoAbs, num, opts, body) {
+  const info = git.ghIssueView(repoAbs, num, ['state', 'labels']);
+  if (!info) throw new UserError(`could not read #${num} from the tracker — refusing to write a decision record blind`);
+  if (info.state !== 'OPEN') {
+    throw new UserError(`#${num} is ${info.state} — record the decision on the issue it actually answers before it closes`);
+  }
+
+  const present = git.ghListLabels(repoAbs);
+  if (present && !present.includes(labels.DECISION_RECORDED_LABEL)) {
+    throw new UserError(labels.decisionRecordedMissingLabelHint(present)
+      || `this repo has no \`${labels.DECISION_RECORDED_LABEL}\` label`);
+  }
+
+  // The comment is the ANSWER — post it FIRST. A crash between here and the label edit leaves the
+  // record live with the gate still on: over-blocking, safe, visible. The reverse order would
+  // reproduce #127 exactly (gate cleared, no record) — see HELP_DECISION.
+  const iso = nowISO();
+  const commentBody = decisionRecord.decisionCommentBody(opts.ruledBy, opts.answers, HOST, iso, body);
+  const commentR = git.ghIssueComment(repoAbs, num, commentBody);
+  if (!commentR.ok) {
+    throw new UserError(`could not post the decision comment on #${num} (${commentR.stderr.split('\n')[0] || commentR.code}) — nothing was written, safe to retry`);
+  }
+
+  const editR = git.ghIssueEdit(repoAbs, num, [
+    '--remove-label', labels.NEEDS_DECISION_LABEL,
+    '--add-label', labels.DECISION_RECORDED_LABEL,
+  ]);
+  if (!editR.ok) {
+    // The comment already posted — the record IS live (safe), so this is NOT rolled back
+    // the way cmdMigrationGrantCreate rolls its label back on a comment failure: there is
+    // nothing safe to undo here, and undoing the comment would throw away the one thing
+    // that succeeded. But the label state disagrees with what was just asserted, so the
+    // success print below must NOT run, and the exit code must say so — a machine reading
+    // this run's result needs "the labels need manual fixing" to be distinguishable from
+    // "this fully succeeded," which printing the success lines here would erase.
+    warn(`the decision comment posted on #${num} but the label swap failed (${editR.stderr.split('\n')[0] || editR.code}) — the record IS live (safe), but the gate labels are stale. Fix by hand:`);
+    warn(`  gh issue edit ${num} --remove-label ${labels.NEEDS_DECISION_LABEL} --add-label ${labels.DECISION_RECORDED_LABEL}`);
+    print(`Recorded #${num}'s decision comment in ${shortRepo(repoAbs)}, but the label swap FAILED — see above. The decision itself is live; fix the labels by hand.`);
+    return 1;
+  }
+
+  print(`Recorded #${num}'s decision in ${shortRepo(repoAbs)}, ruled by ${opts.ruledBy}.`);
+  print(`  ${labels.NEEDS_DECISION_LABEL} cleared, ${labels.DECISION_RECORDED_LABEL} applied.`);
+  print(`  Reopen any time: colab decision ${num} --reopen --ruled-by <name>`);
+  return 0;
+}
+
+function cmdDecisionReopen(repoAbs, num, opts, body) {
+  const info = git.ghIssueView(repoAbs, num, ['state', 'labels', 'comments']);
+  if (!info) throw new UserError(`could not read #${num} from the tracker`);
+  const labelNames = (info.labels || []).map((l) => (l && typeof l === 'object' ? l.name : l));
+  const hasLabel = labelNames.includes(labels.DECISION_RECORDED_LABEL);
+  const live = decisionRecord.liveDecisions(info.comments);
+
+  if (!hasLabel && live.length === 0) {
+    print(`No live decision on #${num} in ${shortRepo(repoAbs)} — nothing to reopen.`);
+    return 0;
+  }
+
+  // Re-apply the gate FIRST — the mirror image of record's order: the safe state to fail toward
+  // here is "still gated," not "reads as decided with no live record."
+  const editR = git.ghIssueEdit(repoAbs, num, [
+    '--remove-label', labels.DECISION_RECORDED_LABEL,
+    '--add-label', labels.NEEDS_DECISION_LABEL,
+  ]);
+  if (!editR.ok) {
+    throw new UserError(`could not swap labels on #${num} (${editR.stderr.split('\n')[0] || editR.code}) — the gate is NOT yet restored; retry`);
+  }
+
+  const commentR = git.ghIssueComment(repoAbs, num, decisionRecord.reopenCommentBody(opts.ruledBy, HOST, nowISO(), body));
+  if (!commentR.ok) {
+    warn(`labels swapped (the gate IS restored) but the reopen receipt failed to post (${commentR.stderr.split('\n')[0] || commentR.code}) — post it by hand for the audit trail.`);
+  }
+
+  print(`Reopened #${num}'s decision in ${shortRepo(repoAbs)} — ${labels.NEEDS_DECISION_LABEL} is restored.`);
+  return 0;
+}
+
+function cmdDecisionList(opts) {
+  const repoAbs = opts.repo ? resolveRepo(opts) : (git.repoRoot(process.cwd()) || null);
+  if (!repoAbs) throw new UserError('not inside a git repo — pass --repo <path>');
+  if (!isGhUsable(repoAbs)) {
+    throw new UserError('gh not usable here (no gh auth or no origin remote) — cannot list decisions');
+  }
+
+  const hits = git.ghIssueListByLabel(repoAbs, labels.DECISION_RECORDED_LABEL, 'open', ['number', 'title']);
+  if (hits === null) {
+    throw new UserError(`could not read ${labels.DECISION_RECORDED_LABEL}-labeled issues from the tracker`);
+  }
+
+  const decisions = [];
+  const stale = [];
+  for (const h of hits) {
+    const info = git.ghIssueView(repoAbs, h.number, ['state', 'labels', 'comments']);
+    const live = info ? decisionRecord.liveDecisions(info.comments) : [];
+    if (live.length === 0) { stale.push(h.number); continue; }
+    const d = live[live.length - 1];
+    decisions.push({ issue: h.number, title: h.title, ruledBy: d.ruledBy, answers: d.answers, authorAssociation: d.authorAssociation, at: d.at });
+  }
+
+  if (opts.json) {
+    return print(JSON.stringify({ repo: shortRepo(repoAbs), label: labels.DECISION_RECORDED_LABEL, decisions, stale }, null, 2));
+  }
+
+  if (decisions.length === 0 && stale.length === 0) {
+    print(`no outstanding decision records in ${shortRepo(repoAbs)}`);
+    return 0;
+  }
+  print(table(
+    decisions.map((d) => [String(d.issue), d.ruledBy || '(unknown)', d.answers === '-' ? '' : d.answers, d.at, d.title]),
+    ['ISSUE', 'RULED BY', 'ANSWERS', 'WHEN', 'TITLE'],
+  ));
+  if (stale.length) {
+    print('');
+    for (const n of stale) warn(`#${n} carries the ${labels.DECISION_RECORDED_LABEL} label but has NO live decision comment — stale state. Reopen or re-record.`);
   }
   return 0;
 }
@@ -6476,6 +6690,8 @@ Commands:
                                         flow, \`ceremony: light\` only — no issue/claim/worktree (#83)
   readiness <issue> [--clear] [--mechanical] [--repo P]              own the deps-checked / graph-empty markers (§5)
   migration-grant <issue> --branch B | --revoke | --list [--json]    human-only ship migration exemption (#98)
+  decision <issue> --record --ruled-by N | --reopen --ruled-by N | --list [--json]
+                                        record/reopen a needs-decision answer (#121, #122)
   ci-grant <issue> --branch B | --revoke | --list [--json]           human-only ship trunk-CI-green exemption (#105)
   claims [--json] [--sync]                                            list / reconcile with GitHub
 
@@ -6546,6 +6762,7 @@ function main(argv) {
     case 'solo': return cmdSolo(rest);
     case 'readiness': return cmdReadiness(rest);
     case 'migration-grant': return cmdMigrationGrant(rest);
+    case 'decision': return cmdDecision(rest);
     case 'ci-grant': return cmdCiGrant(rest);
     case 'claims': return cmdClaims(rest);
     case 'port': return cmdPort(rest);

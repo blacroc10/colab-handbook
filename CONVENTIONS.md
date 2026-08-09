@@ -536,7 +536,8 @@ Ask: permission | backlog | ruling | deferred(<trigger>)
 - **`backlog`** — a work proposal to accept and schedule, not a decision itself; also the
   default when the line is absent.
 - **`ruling`** — resolves to human judgment, never startable as code — same class as
-  `needs-ruling`.
+  `needs-decision`. (`ruling` is the ASK CLASS, unchanged by #122's label rename below — see
+  the note there: the two names are deliberately kept independent.)
 - **`deferred(<trigger>)`** — no action needed now; the issue carries its own wake
   condition.
 - **Absent line means `backlog`** — every pre-existing `agent-filed` issue reads as the
@@ -657,21 +658,46 @@ colab readiness <N> --mechanical --clear
   means `deps-checked` specifically (#45, #46); emitting it here would be
   indistinguishable from the stronger claim.
 
-#### Design ruling — a human must approve the design first
+#### Decision gate — a human must answer first (#122)
 
-A designer producing a spec decides, while producing it, whether a surface needs human
-pre-approval before code starts, and marks the issue `needs-ruling` if so — the call
-belongs to whoever is producing the spec, never inferred mechanically from title or
+Some issues cannot start, or cannot finish, until a human answers a blocking question —
+a design pre-approval, a business-logic call, a permission. `needs-decision` (named
+`needs-ruling` before #122; widened because "ruling" read narrower than the gate actually
+covers) marks that. A designer producing a spec decides, while producing it, whether a
+surface needs human pre-approval before code starts, and applies the label if so — the
+call belongs to whoever is producing the spec, never inferred mechanically from title or
 labels.
 
-**`needs-ruling` blocks starting the issue** — a readiness gate exactly like an open hard
-blocker or a live claim — until a human reviews the artifact and removes the label. No
-session, manual or scheduled, starts an issue that still carries it.
+**`needs-decision` blocks starting the issue** — a readiness gate exactly like an open
+hard blocker or a live claim — until a human answers and that answer is **recorded**
+(below). No session, manual or scheduled, starts an issue that still carries it.
 
 **A session discovering a significant design decision mid-work continues on the
 designer's spec** rather than stopping to request a ruling, and records
 `design-not-preapproved` in its ship evidence — so the closure itself is what a human
-reviews, after the fact.
+reviews, after the fact. This default stays the rule everywhere a usable default exists.
+
+**The third path (#122) — only when there is no usable default and the work genuinely
+cannot finish.** A session that hits a genuine, blocking, non-design ruling mid-work — not
+a design fork with a spec to fall back on, but a question with no default answer — files
+the ruling as its **own** issue, wires a `blocked_by` edge (§*Readiness*, above) from the
+issue it is working, and **keeps its claim**. The question becomes visible where humans
+and triage already look — a labelled issue, not prose in a comment nobody scans — while
+the work stays owned so no second session picks it up mid-flight. **This is not licence to
+stop on any fork** — the default-exists case above is unchanged and still the ordinary
+rule; this path exists only for the genuinely blocking, no-default case.
+
+**Recording the decision is what clears the gate — it is not a separate act a human must
+remember.** Measured failure (#127): a ruling was posted as ordinary prose in a comment
+and the `needs-decision` label removed by hand. A later triage pass, reading the issue
+fresh, saw no machine-readable trace of a decision, re-gated it, and reported it
+not-startable — the ruling had been sitting in the comment the whole time. **A cleared
+label is indistinguishable from a label never applied.** So the answer, not the label's
+absence, is the artifact: a `⚖ Decision recorded` comment (`tools/lib/decision-record.js`)
+naming who ruled and what it answers, plus the `decision-recorded` label, written together
+by `colab decision <N> --record --ruled-by <name>` — never `needs-decision` cleared alone.
+A reader checking whether an issue is decided looks for `decision-recorded` or the live
+comment marker, never merely for `needs-decision`'s absence.
 
 #### Migration exemption — a narrow, human-created door through no-new-migrations (#98)
 
@@ -729,13 +755,16 @@ stops applying; this is what a scheduler must additionally honour.
 - `agent-filed` issues are excluded from what a scheduler starts, every run.
 - `epic`-labelled issues are excluded — an epic can pass provenance cleanly and still not
   be a pick-up-and-code task.
-- `needs-ruling` issues are excluded, for a third distinct reason: no human has approved
-  the design, even if the work item itself is human-filed, unblocked, and a genuine leaf
-  task.
-- **The only admission is a human act on the issue itself, removing the label** — a
-  scheduler may never infer approval from content, age, or repeat proposal.
+- `needs-decision` issues are excluded, for a third distinct reason: no human has answered
+  the blocking question, even if the work item itself is human-filed, unblocked, and a
+  genuine leaf task.
+- **The only admission is a human act recording the decision** (`colab decision --record`,
+  above) — a scheduler may never infer an answer from content, age, or repeat proposal,
+  and never treats the label's mere absence as an answer: it checks for
+  `decision-recorded` or the live comment marker, since a cleared `needs-decision` with
+  neither present is the stale, not-yet-swept state, not a decided one.
 - An `agent-filed` issue whose `Ask:` reads `ruling` or `permission` is excluded, for the
-  same reason `needs-ruling` is.
+  same reason `needs-decision` is.
 
 **A scheduler starts work only by spawning ordinary sessions** (`code-triage` →
 `code-start` → work → `code-wrap` → where granted, `code-ship`) — it may not claim,
@@ -829,7 +858,7 @@ territory.
 never collapse into "non-code"** — every issue is unlabelled the day this set is adopted,
 and reading absence as non-code would freeze every scheduled driver on day one.
 
-`content`/`ops`/`docs-only` gate exactly like `needs-ruling` — not a start candidate for
+`content`/`ops`/`docs-only` gate exactly like `needs-decision` — not a start candidate for
 anyone. A session landing on one distills the finding onto the issue and ends the
 session. Whoever files or triages sets the label — no mechanical rule infers it from a
 title or body. `delivery:*` is in the provisioned label set because every adopting repo
@@ -935,7 +964,9 @@ correct resolution was their union, not either side.
 A design ruling needs one more part: an **immutable visual record**.
 
 1. **The ruling** — on the Issue immediately, exactly as Step 1: chosen option, why, what
-   was rejected. This is what clears `needs-ruling`.
+   was rejected. This is what clears `needs-decision` — recorded as the *Decision gate*
+   section's `⚖ Decision recorded` marker (`colab decision --record`), never as prose
+   alone with the label cleared by hand.
 2. **The artifact** — a repo file under `docs/design/`, named `<slug>-<N>-mockup.html` or
    `<slug>-<N>-spec.md`, landing via a claimed docs branch. **Superseded artifacts are
    marked, never deleted** — trunk carries the design lineage.
@@ -1143,16 +1174,17 @@ only. Resolution order: `--config` flag > `~/.colab/repos.txt` > bundled example
 1. **Determine the tier** — does a deploy target exist *today* ([§2](#2-tiers))? No →
    Tier B. Yes → does a tag gate production (A), or does the promotion itself deploy (C)?
 2. **Write `.github/project.yml`** ([§3](#3-githubprojectyml--the-marker)).
-3. **Create the whole label set — twelve names, not a subset** (`in-progress`,
-   `deps-checked`, `agent-filed`, `epic`, `needs-ruling`, `needs-plan`,
-   `migration-granted`, `ci-granted`, and the four `delivery:*`), each idempotent
-   (`|| true`) because partial adoption is normal:
+3. **Create the whole label set — thirteen names, not a subset** (`in-progress`,
+   `deps-checked`, `agent-filed`, `epic`, `needs-decision`, `decision-recorded`,
+   `needs-plan`, `migration-granted`, `ci-granted`, and the four `delivery:*`), each
+   idempotent (`|| true`) because partial adoption is normal:
    ```sh
    gh label create in-progress       --color FBCA04 --description "Claimed by an active session"  2>/dev/null || true
    gh label create deps-checked      --color 0E8A16 --description "Dependencies verified — no open blocker"  2>/dev/null || true
    gh label create agent-filed       --color C5DEF5 --description "Filed by an agent on its own initiative — not human-approved"  2>/dev/null || true
    gh label create epic              --color 3E4B9E --description "Container for sub-issues — informative, never a start candidate, never claimed as a unit of work"  2>/dev/null || true
-   gh label create needs-ruling      --color B60205 --description "Needs a human design ruling before this can start"  2>/dev/null || true
+   gh label create needs-decision    --color B60205 --description "A human must answer a blocking question before this can start"  2>/dev/null || true
+   gh label create decision-recorded --color 006B75 --description "A human answered here — read the ⚖ Decision comment before re-applying needs-decision"  2>/dev/null || true
    gh label create needs-plan        --color 0052CC --description "Triage judged this hard — code-start should run code-plan before coding"  2>/dev/null || true
    gh label create migration-granted --color D93F0B --description "A human granted this issue's branch an exemption from ship's no-new-migrations gate"  2>/dev/null || true
    gh label create ci-granted         --color D73A4A --description "A human granted this branch a one-shot exemption from ship's trunk-CI-green gate"  2>/dev/null || true
@@ -1164,13 +1196,16 @@ only. Resolution order: `--config` flag > `~/.colab/repos.txt` > bundled example
    What each absence costs, briefly: `in-progress` — the first claim cannot land.
    `deps-checked` — a readiness check can never tell *free* from *nobody looked*.
    `agent-filed` — every agent-filed issue reports as human-approved. `epic` — an epic
-   passes every readiness gate and reads as a normal start candidate. `needs-ruling` — the
-   design-approval gate cannot be applied at all. `needs-plan` — `code-start` always sees
-   "no flag", every session falls back to rung 1. `migration-granted`/`ci-granted` are
-   **not opt-in** (unlike `tracking`) — absence fails malignantly, discovered only when a
-   repo hits the wall with no route past `ship`'s gate at all. `delivery:*` — a content
-   push or ops check has no way to say "not a diff" and jams the code pipeline. This full
-   set is provisioned again on every sync, not only at adoption.
+   passes every readiness gate and reads as a normal start candidate. `needs-decision` —
+   the blocking-question gate cannot be applied at all. `decision-recorded` — a recorded
+   answer has no positive marker to distinguish it from a label nobody ever applied, so the
+   next mechanical pass re-gates settled work (measured: #127). `needs-plan` —
+   `code-start` always sees "no flag", every session falls back to rung 1.
+   `migration-granted`/`ci-granted` are **not opt-in** (unlike `tracking`) — absence fails
+   malignantly, discovered only when a repo hits the wall with no route past `ship`'s gate
+   at all. `delivery:*` — a content push or ops check has no way to say "not a diff" and
+   jams the code pipeline. This full set is provisioned again on every sync, not only at
+   adoption.
 4. **Add the tier topic** — `gh repo edit <owner>/<repo> --add-topic tier-b` (or
    `tier-c`/`tier-a`).
 5. **Add the handbook pointer to `CLAUDE.md`** — copy
