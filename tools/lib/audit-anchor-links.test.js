@@ -171,10 +171,10 @@ test('a bare FILE.md#slug mention with no markdown-link brackets is ignored', ()
   assert.deepStrictEqual(r.fails, []);
 });
 
-test('an external http(s) link with a fragment is ignored', () => {
+test('an external http(s) link with a .md fragment is ignored', () => {
   const r = audit(fixture({
     'docs/x.md': 'See [external](https://example.com/page#frag-that-does-not-exist-here).\n',
-  }));
+      'docs/x.md': 'See [external](https://example.com/README.md#frag-that-does-not-exist-here).\n',
   assert.deepStrictEqual(r.fails, []);
 });
 
