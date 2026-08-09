@@ -531,6 +531,16 @@ Design notes, in case a future change is tempted to relax one:
   "solo": {
     "/abs/repo": { "host": "machine", "session": "https://claude.ai/code/session_…",
                    "sessionName": "colab-handbook", "since": "<iso>" }
+  },
+  "places": {
+    "/abs/repo/or/worktree/path": {
+      "path": "/abs/repo/or/worktree/path", "repo": "/abs/repo",
+      "branch": null,                          // same representation as a claim's — null or a real name
+      "host": "machine", "session": "https://claude.ai/code/session_…",
+      "sessionName": "colab-handbook",
+      "pid": 4242,                              // the LONG-LIVED holder's pid, never a `colab` invocation's own
+      "since": "<iso>"
+    }
   }
 }
 ```
@@ -550,11 +560,19 @@ Design notes, in case a future change is tempted to relax one:
   live sessions straight from it. Treat the shape as a published contract: adding a field is safe,
   renaming or removing one breaks consumers you cannot grep for.
 - **`solo` is keyed by repo, not by issue or worktree.** Solo flow (CONVENTIONS.md, *Solo flow*;
-  `ceremony: light` only) makes no claim and no worktree, so it needed its own machine-local lock —
-  `colab solo` writes it after its entry gate passes (no worktree/claim held, checkout on trunk, no
-  unpushed branch, clean tree), and `colab solo --done` is the only remover, after re-checking clean
-  + pushed. A consumer that infers activity from `worktrees`/`claims` alone will under-report a repo
-  running solo — reading `solo` too is that consumer's own call, same as the readiness label's.
+  `writes: serial`, or legacy `ceremony: light`) makes no claim and no worktree, so it needed its
+  own machine-local lock — `colab solo` writes it after its entry gate passes (no worktree/claim
+  held, checkout on trunk, no unpushed branch, clean tree, no conflicting place-claim), and
+  `colab solo --done` is the only remover, after re-checking clean + pushed. A consumer that infers
+  activity from `worktrees`/`claims` alone will under-report a repo running solo — reading `solo`
+  too is that consumer's own call, same as the readiness label's.
+- **`places` is keyed by absolute checkout PATH** — the writer-verifiable hold `writes: serial`
+  needs (CONVENTIONS.md, *Place-claims*; #136). Unlike `solo`, it is not repo-scoped: a repo running
+  several worktrees needs one hold per checkout in use. `colab place check <path>` lets ANY writer
+  ask "may I write here right now", not just `colab solo`'s own entry gate — the thing a spawn-time
+  lock cannot answer for an implementer agent fanned out by a coordinator. **Never trust a stored
+  flag for release** — every reader (`colab place check`, `colab places`, `colab doctor`) re-derives
+  liveness from `pid` at read time; a record surviving its holder's death is expected, not a bug.
 
 ### Records that cannot be acted on
 
@@ -686,7 +704,9 @@ Run `colab <cmd> --help` for full detail.
 | `release <issue> [--repo P]` | release a single issue; siblings + worktree survive |
 | `issue-filed <issue> [--repo P]` | notify-only event (`issue.filed`, #102) for an issue a raw `gh issue create` just made — no state.json entry, no label, no gh call of its own |
 | `gate-recorded [--sha S] [--fail] [--worktree N] [--repo P]` | notify-only event (`gate.recorded`, #116) for code-wrap's own A3 quality-gate step — no state.json entry, no label, no gh call of its own |
-| `solo [--force] [--session S] [--session-name S] [--repo P]` \| `solo --done [--repo P]` | entry-gated trunk-direct flow — `ceremony: light` only, no issue/claim/worktree (see *Solo flow*, CONVENTIONS.md) |
+| `solo [--force] [--session S] [--session-name S] [--repo P]` \| `solo --done [--repo P]` | entry-gated trunk-direct flow — `writes: serial` (or legacy `ceremony: light`) only, no issue/claim/worktree (see *Solo flow*, CONVENTIONS.md) |
+| `place acquire\|check\|release <path> [--repo P] [--session S] [--session-name S] [--force]` | path-scoped, machine-local checkout hold `writes: serial` needs (see *Place-claims*, CONVENTIONS.md; #136). `check` exits 0/1/2 (free-or-mine / held-by-a-live-other / liveness-unknown-or-lock-unreachable); releasing someone else's hold requires `COLAB_HUMAN=1` |
+| `places [--json]` | list every place-claim on this machine, liveness resolved right now (never a stored flag) |
 | `readiness <issue> [--clear] [--repo P]` | own the `deps-checked` marker (§5): add it after verifying no open blocker, `--clear` on a new blocker or reopen. Journaled; refuses when `gh` is unusable (the marker has no local-only form) |
 | `claims [--json] [--sync [--prune]]` | list (grouped by worktree); `--sync` **adds** claims found on GitHub (assigned + in-progress); `--prune` also **removes** local claims GitHub no longer shows |
 | `port alloc [--count N] [--range A-B \| --at p1,p2,...] [--worktree N \| --claim I \| --label S]` | allocate consecutive free ports, or pin exact ports with `--at` |
@@ -958,6 +978,8 @@ Required properties, and how each is met:
   — the identical bar `colab promote` holds a production promotion to, and the check runs
   *before* any network call. No flag, no `project.yml` field, and no inference from an issue's
   content, age, or park count can produce a grant. Revoke carries the same bar.
+  (`colab place release`/`--force acquire` on someone else's hold uses this same
+  `COLAB_HUMAN=1` bar — see *Place-claims*, CONVENTIONS.md; #136.)
 - **Bound to one issue AND one branch.** The grant is a `migration-granted` label (index +
   GitHub's own write-permission check — a drive-by public commenter cannot manufacture one) plus
   a comment on the issue carrying the exact branch name (a label alone cannot: GitHub caps label

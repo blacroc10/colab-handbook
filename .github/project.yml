@@ -25,6 +25,12 @@
 #               NOTE requirements.txt is not a source: it pins dependencies, never
 #               the interpreter, so a Python repo with only that file must declare
 #               `python:` here (or add .python-version) or CI has nothing to resolve.
+#   writes      OPTIONAL. isolated (default) | serial. Which write-conflict prevention
+#               method this repo's sessions default to — a separate axis from tier and
+#               ceremony (project.schema.md "writes — optional"). This repo genuinely
+#               runs isolated (many concurrent worktrees), so the key stays unset here —
+#               a reference example that sets every optional key stops demonstrating
+#               which ones are actually required.
 #
 tier: B
 trunk: main

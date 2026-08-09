@@ -184,28 +184,70 @@ ports, squash + `Closes #N`, CI secret scan). Two backstops: a `light` repo must
 `production: null` (a live repo cannot skip its own audit trail), and it may not combine
 with `autonomy: auto-trunk` (an unattended merge with no evidence trail is unauditable).
 
-### Solo flow — trunk-direct, issue-on-demand, entry-gated (`ceremony: light` only)
+### Writes — serial or isolated, and the two things that make a branch mandatory
+
+**A fifth axis, and the last one this section separates out.** `writes` names which
+write-conflict prevention method a repo's sessions default to
+([`writes`](project.schema.md#writes--optional)) — a different question from `tier`
+(gates to production), `ceremony` (record-keeping depth), or `integration` (a development
+line). Three methods are coherent; one combination is not:
+
+| method | writer count | branches? | this is… |
+|---|---|---|---|
+| serial trunk-direct | one at a time | no | solo flow, below |
+| serial gated | one at a time | yes, when the two conditions below apply | the common case: a claim, a branch, a squash |
+| isolated | many, concurrently | yes, always (worktrees) | today's fleet default |
+| *(N writers, trunk-direct)* | many | no | **not a method** — simply an unlocked repo |
+
+The fourth row is named, not left implicit: nothing coordinates concurrent trunk-direct
+writers, so it is not a degraded version of the other three, it is the absence of a
+method. A repo cannot select it; it is what "no `writes` discipline at all" looks like.
+
+**Exactly two conditions make a branch mandatory** on a `writes: serial` repo — no others:
+
+1. **More than one unit of work is in flight** — a second claim, worktree, or place-claim
+   already live on the repo. One writer stops being true, so the branch is what draws the
+   boundary between units.
+2. **A gate must inspect the unit before it lands** — CI, review, or any check that needs
+   something to point at. Trunk-direct has nothing to gate.
+
+**Not on that list: "it feels safer."** A branch is one way to draw a unit boundary; a
+place-claim (below) is another, and where neither condition applies, the place-claim is
+the whole guarantee — adding a branch on top buys nothing the lock did not already give.
+Nor does "so the changelog reads cleanly" qualify — a solo session's Conventional Commits
+already group correctly without one.
+
+**Deliberately not coupled to exposure, tier, or production.** The correlation visible
+across today's fleet — light/beta repos tending to run solo, live repos tending to branch
+— is caused by *who works a repo* (one person vs. several), not by *what consumes it*
+(nobody vs. production users). A quiet Tier A repo with one session in flight needs no
+branch on `writes` grounds; a busy Tier B playground with three sessions does. Encoding
+the observed correlation as an audited rule would repeat the same weld `ceremony` was
+introduced to undo (`ceremony` vs. `tier`, above) — so no such rule exists, and none
+should be added later "to catch the common case."
+
+### Solo flow — trunk-direct, issue-on-demand, entry-gated (`writes: serial`, or legacy `ceremony: light`)
 
 `ceremony: light` relaxed the record-keeping *end* of a session; the *start* — pre-filed
-issue, claim, branch, worktree — stayed full weight even there. Solo flow is for a repo
-one person codes directly, in one conversation-driven session, with no other session to
-protect against — the start-side invariants exist to protect *other* sessions.
+issue, claim, branch, worktree — stayed full weight even there. Solo flow is the **serial
+trunk-direct** cell of the table above: a repo one person codes directly, in one
+conversation-driven session, with no other session to protect against — the start-side
+invariants exist to protect *other* sessions.
 
 1. **Entry gate, not honor system.** `colab solo` checks fresh on every invocation, never
    a cached answer: no live solo session already open, no worktree, no claim, checkout on
-   trunk with no unpushed branch anywhere, and a clean (tracked + untracked) tree.
-   Anything held refuses outright — full ceremony, no partial credit. *(On a file-synced
-   checkout the residual sync-window race in cross-machine visibility is accepted
-   deliberately — solo flow means a human is personally driving one checkout, not a fleet
-   of unattended sessions.)*
+   trunk with no unpushed branch anywhere, a clean (tracked + untracked) tree, and — on a
+   `writes: serial` repo — no conflicting place-claim held on this checkout (below).
+   Anything held refuses outright — full ceremony, no partial credit.
 2. **Trunk-direct commits are allowed.** Small Conventional Commits go straight to trunk;
    CI validates after the push. Branching remains available whenever a squash unit is
-   wanted — solo flow stops requiring it, not forbidding it.
+   wanted, or whenever one of the two mandatory-branch conditions above fires — solo flow
+   stops requiring a branch, it does not forbid one.
 3. **An Issue is filed on demand**, not on entry — recording a decision, or work spanning
    more than one sitting.
 4. **Exit check, not teardown.** `colab solo --done` re-derives fresh: tree clean,
    everything pushed. Nothing to tear down — solo flow made no worktree and holds no
-   claim.
+   claim, though it releases any place-claim it took.
 5. **Never relaxed, even solo:** CI secret scan · reserved ports · Conventional Commits ·
    `production: null` · not `autonomy: auto-trunk` · no scheduled driver (doubly
    incompatible — a driver planning against a repo reads its Issues, and a solo repo may
@@ -213,12 +255,74 @@ protect against — the start-side invariants exist to protect *other* sessions.
 
 **The boundary is concurrency reality, not a discipline preference.** A repo more than
 one session touches can never legally run solo flow — the entry gate's own checks are
-false by construction the moment a second session exists. `ceremony: light` is necessary
-but not sufficient: a light repo currently hosting someone else's worktree still fails
-`colab solo`'s check, correctly.
+false by construction the moment a second session exists. `writes: serial` (or legacy
+`ceremony: light`) is necessary but not sufficient: a repo currently hosting someone
+else's worktree, or someone else's place-claim, still fails `colab solo`'s check,
+correctly.
 
 **Consumers inferring activity purely from worktrees/claims will under-report a solo
 session** — fixing that is each such consumer's own call, not mandated here.
+
+### Place-claims — the writer-verifiable hold `writes: serial` needs, and isolation does not
+
+An **isolated** writer needs no lock: its worktree already is the isolation. A **serial**
+writer does — one checkout, no branch, so nothing but a lock stops two sessions (or an
+implementer agent fanned out by a coordinator, which never went through anything that
+could refuse a spawn) from writing the same trunk checkout at once. A place-claim is that
+lock: **path-scoped**, not repo-scoped — the checkout path is the unit, so a repo running
+multiple worktrees still needs only one hold per checkout in use — **held by a session**
+and **verified by the writer itself**, not merely by whatever spawned it.
+
+- **What it is not.** Three partial mechanisms already exist in this fleet and none is a
+  place-claim: the claim registry holds an *issue*, not a *place*; a worktree's existence
+  implies nothing about who is writing to it *right now* (creating one is taking it — there
+  is no separate act, and nothing has refused a second writer since); and a session
+  spawner's own trunk-lock (below) is keyed to *spawning a ship-kind session*, which cannot
+  answer "may I write here right now" for work that never came through a spawn.
+- **Reuses the existing null-branch representation — nothing new is invented.** A hold on
+  the main checkout records `branch: null`, exactly the value a trunk-checkout claim
+  already carries; a hold on a worktree records that worktree's real branch name. The
+  same rule that refuses the literal word `trunk` as a branch value elsewhere applies here
+  too.
+- **Release is a liveness lookup at read time — never a state transition written at kill
+  time.** "Dies with its session" is what a reader assumes, and it is not what a purely
+  written record can promise: nothing reliable runs at the moment a session dies. So a
+  place-claim's *check* re-derives whether its holder is still alive every time it is
+  read, rather than trusting a stored `released` flag. Measured on the one such lock
+  already running in this fleet (a session dashboard's spawn-time trunk-lock, refusing a
+  second `ship`/`sweep`-kind spawn with the holder named): it releases only once a poller
+  *notices* the holder died, roughly a minute later — so immediately re-spawning after a
+  kill gets a refusal indistinguishable from a genuine conflict. A read-time liveness
+  check has no such lag; adopt that stronger semantics rather than the poller's.
+- **Never in a file-synced location.** A Resilio/Syncthing/Dropbox/iCloud path has no
+  atomicity and no consistency guarantee inside its sync window — two sessions can each
+  read "unlocked," each write "held by me," and both proceed *with confidence*, which is
+  worse than having no lock at all. A place-claim refuses to acquire from such a path.
+- **Degraded mode: serial falls back to isolated, never to unlocked.** If the lock cannot
+  be reached (state unreadable, or the acquire itself is what lives on a synced path), the
+  writer is told to use a worktree and branch instead — which needs no lock. Speed is what
+  degrades, never safety; nothing ever proceeds trunk-direct without a hold.
+- **Override is a human act.** A held place-claim with a live holder is a genuine refusal,
+  not friction to route around; overriding one requires the same `COLAB_HUMAN=1` bar as
+  a migration grant or a promotion. An `unknown`-liveness holder (recorded by session URL
+  only, with nothing locally probable) is exactly the case where a human is needed, and
+  the refusal names both remedies: wait for the liveness window to clear, or override on
+  the confirmed knowledge that the session is gone.
+
+**A related lock already exists outside this convention, and this section describes it
+rather than forking it.** A session dashboard refuses to spawn a second `ship`/`sweep`
+session per repo, naming the holder. That mechanism's *semantics* — held by a session,
+checked before work starts, refuses rather than warns, releases on holder death — are
+what this section generalizes to any writer on any checkout, not a competing design; the
+lag correction above (poller vs. read-time liveness) is the one place the generalization
+is deliberately *stronger* than what it started from.
+
+**Explicitly out of scope: any cross-machine or distributed form of this lock.** A
+place-claim is machine-local state (`~/.colab/state.json`); two machines each holding
+their own local lock on what happens to be the same logical repo is a distributed-systems
+question this convention does not answer. The existing backstop — separate working
+trees, plus git's own push rejection on a stale ref — remains what prevents two machines
+from landing the same conflict undetected.
 
 ---
 

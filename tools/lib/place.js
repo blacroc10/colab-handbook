@@ -1,0 +1,256 @@
+'use strict';
+/**
+ * Place-claims (CONVENTIONS.md, "Place-claims") — the writer-verifiable hold `writes: serial`
+ * needs and `isolated` does not (#136).
+ *
+ * WHAT THIS IS NOT. Three partial mechanisms already exist in this fleet and none is a
+ * place-claim: the claim registry (lib/state.js `claims`) holds an ISSUE, not a PLACE; a
+ * worktree's existence implies nothing about who is writing to it right now (creating one is
+ * taking it — there is no separate act); and a session dashboard's own spawn-time trunk-lock is
+ * keyed to spawning a ship/sweep-kind session, which cannot answer "may I write here right now"
+ * for work that never came through a spawn (an implementer agent fanned out by a coordinator,
+ * for instance). This module is that missing, general primitive.
+ *
+ * RELEASE IS A LIVENESS LOOKUP AT READ TIME, NEVER A STATE TRANSITION WRITTEN AT KILL TIME.
+ * "Dies with its session" is what a reader assumes and is not what a stored flag can promise —
+ * nothing reliable runs at the moment a session dies. Measured on the one such lock already
+ * running in this fleet (the dashboard's spawn-time trunk-lock): it releases only once a poller
+ * NOTICES the holder died, roughly a minute later, so a caller that kills a session and
+ * immediately retries gets a refusal indistinguishable from a genuine conflict. This module does
+ * not write a `released` flag at all — `isLive`/`holderOf`/`conflict` re-derive liveness on every
+ * call, so a dead holder's record disappears from a caller's point of view the instant it is next
+ * read, with no lag and no poller.
+ *
+ * MACHINE-LOCAL ONLY, DELIBERATELY (#128 §10 Q3, out of scope). A place-claim lives in
+ * ~/.colab/state.json, keyed by absolute checkout PATH — not by repo, so a repo running several
+ * worktrees needs one hold per checkout in use. Two machines each holding their own local lock on
+ * what happens to be the same logical repo is a distributed-systems question this module does not
+ * answer; the existing backstop (separate working trees, git's own push rejection on a stale ref)
+ * remains what prevents two machines from landing the same conflict undetected. A record whose
+ * `host` does not match this machine is proof `~/.colab` itself is being synced across machines,
+ * which `syncedStateProblem` below treats as the same hazard as a synced lock file.
+ *
+ * NEVER IN A FILE-SYNCED LOCATION. A Resilio/Syncthing/Dropbox/iCloud path has no atomicity and no
+ * consistency guarantee inside its sync window: two sessions can each read "unlocked", each write
+ * "held by me", and both proceed WITH CONFIDENCE — worse than having no lock. `syncedStateProblem`
+ * refuses an acquire from such a path; it is a heuristic (a marker scan), and the foreign-host
+ * check in `isLive` is the behavioural backstop that fires even when the marker scan misses.
+ *
+ * DEGRADED MODE: SERIAL FALLS BACK TO ISOLATED, NEVER TO UNLOCKED. If the lock cannot be reached —
+ * state unreadable, the lock directory stuck — callers are told to use a worktree and branch
+ * instead, which needs no lock. Speed degrades; safety never does. THIS MODULE DOES NOT IMPLEMENT
+ * THAT ITSELF — `state.loadState()`/`state.mutate()` are what can throw on an unreadable file or a
+ * stuck lock, and `place.js` never calls either (every function here takes an already-loaded state
+ * object). The catch lives in `tools/colab`'s `placeState()`/`placeMutate()` helpers, used by every
+ * caller that acquires or checks a place-claim (`cmdSolo`, `cmdClaim`'s trunk-checkout path,
+ * `cmdPlace`) — see those for the actual degrade behaviour, exit code 2 on `cmdPlace`.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const procs = require('./procs');
+
+/**
+ * Resolve a checkout path to the canonical string every caller keys against — `realpath` so a
+ * symlink or a `./`-suffixed path resolves to the SAME key as its canonical form. Falls back to
+ * `path.resolve` when the path does not exist on disk (e.g. checking a place that may already have
+ * been torn down) rather than throwing, because a missing directory is a legitimate thing to ask
+ * "is anything holding this?" about.
+ */
+function placeKey(pathAbs) {
+  const resolved = path.resolve(pathAbs);
+  try {
+    return fs.realpathSync(resolved);
+  } catch (_) {
+    return resolved;
+  }
+}
+
+/**
+ * Build a hold record. `branch` follows the SAME representation a claim's does — `null` for "the
+ * trunk checkout" (never the literal word `trunk`, refused by `records.branchProblem` at write
+ * time in lib/state.js's `mutate`), a real name for a worktree. `pid` is optional: a hold acquired
+ * on behalf of a process this module cannot introspect (e.g. relayed from a session id alone) may
+ * omit it, and its absence makes the hold's liveness `unknown` — see `isLive` below. CALLERS
+ * SHOULD PASS THE LONG-LIVED PROCESS's pid, not a short-lived CLI invocation's own — `tools/colab`
+ * passes `process.ppid` for exactly this reason: the `colab` process that acquires a hold exits the
+ * moment the command returns, so its own pid would already read dead by the time anything checks.
+ */
+function holdRecord({ pathAbs, repo, branch = null, host, session, sessionName, pid = null, since }) {
+  return {
+    path: placeKey(pathAbs),
+    repo,
+    branch,
+    host: host || os.hostname(),
+    session: session || null,
+    sessionName: sessionName || null,
+    pid: pid || null,
+    since: since || new Date().toISOString(),
+  };
+}
+
+/**
+ * The default liveness probe — a pure function of one record, injectable so tests never depend on
+ * what happens to be running on the machine. Returns `true` (live, hold stands), `false` (dead,
+ * not a hold), or `null` (cannot tell, FAILS CLOSED — the hold stands and the message says why).
+ *
+ * Order matters: a foreign host is checked before pid liveness, because a record naming a pid on
+ * another machine is not "unknown" in the ordinary sense — it is evidence of the sync hazard this
+ * module exists to refuse, and that is worth a distinct message.
+ */
+function defaultProbe(rec) {
+  if (!rec) return false;
+  if (rec.host && rec.host !== os.hostname()) return null; // foreign-host — see isLive's message
+  if (rec.pid) return procs.alive(rec.pid);
+  return null; // no pid recorded — cannot probe locally, fails closed
+}
+
+/**
+ * Liveness of one hold record, as `{live, reason}`. `live` is `true`/`false`/`null` (unknown,
+ * fails closed — treated as held everywhere in this module). Never trusts a stored flag; every
+ * call re-runs `probe` against the record as it stands right now.
+ */
+function isLive(rec, probe = defaultProbe) {
+  if (!rec) return { live: false, reason: 'no record' };
+  if (rec.host && rec.host !== os.hostname()) {
+    return {
+      live: null,
+      reason: `recorded on host "${rec.host}", not this machine ("${os.hostname()}") — ` +
+        'either a genuinely different machine (place-claims are machine-local only, CONVENTIONS.md ' +
+        '"Place-claims") or ~/.colab is itself being synced, which is the same hazard this module ' +
+        'refuses for the lock file itself',
+    };
+  }
+  const verdict = probe(rec);
+  if (verdict === true) return { live: true, reason: `pid ${rec.pid} is alive` };
+  if (verdict === false) return { live: false, reason: rec.pid ? `pid ${rec.pid} is gone` : 'no longer live' };
+  return {
+    live: null,
+    reason: 'no pid recorded — cannot probe liveness locally, failing closed (hold stands)',
+  };
+}
+
+/**
+ * The hold on `pathAbs`, if any, with its liveness resolved right now. Returns `null` when there
+ * is no record at all — genuinely free, not merely "nothing found yet".
+ */
+function holderOf(st, pathAbs, probe = defaultProbe) {
+  const key = placeKey(pathAbs);
+  const rec = (st && st.places && st.places[key]) || null;
+  if (!rec) return null;
+  const { live, reason } = isLive(rec, probe);
+  return { rec, live, reason };
+}
+
+/**
+ * Would acquiring `pathAbs` for `self` (an optional {session} to exempt the caller's own
+ * re-acquire/renew) conflict with an existing hold? Returns `null` for clear ground, or
+ * `{holder, kind, message}` — `kind` is `'held'` (a live other holder, refuse), `'unknown'`
+ * (liveness could not be resolved, refuse and name the remedy), or `'foreign-host'` (refuse,
+ * citing the sync hazard).
+ */
+function conflict(st, pathAbs, self = {}, probe = defaultProbe) {
+  const h = holderOf(st, pathAbs, probe);
+  if (!h) return null;
+  if (self && self.session && h.rec.session === self.session) return null; // re-acquire by the same holder
+
+  if (h.rec.host && h.rec.host !== os.hostname()) {
+    return {
+      holder: h.rec,
+      kind: 'foreign-host',
+      message: `place "${h.rec.path}" is recorded held from host "${h.rec.host}" — ${h.reason}`,
+    };
+  }
+  if (h.live === false) return null; // dead holder — clear ground, nothing to refuse
+  if (h.live === null) {
+    return {
+      holder: h.rec,
+      kind: 'unknown',
+      message: `place "${h.rec.path}" is held by session "${h.rec.sessionName || h.rec.session || 'unknown'}" ` +
+        `and its liveness cannot be confirmed locally (${h.reason}) — wait a moment and check again if it may ` +
+        'have just died, or override with COLAB_HUMAN=1 once you know that session is gone',
+    };
+  }
+  return {
+    holder: h.rec,
+    kind: 'held',
+    message: `place "${h.rec.path}" is held by session "${h.rec.sessionName || h.rec.session || 'unknown'}" (${h.reason})`,
+  };
+}
+
+/**
+ * Every place record whose holder is confirmed dead — `colab doctor`'s report, same shape as
+ * `staleClaims`. Deliberately excludes `unknown` liveness: a record this module cannot disprove is
+ * held stays out of a report that implies "safe to prune".
+ */
+function stalePlaces(st, probe = defaultProbe) {
+  const out = [];
+  for (const [key, rec] of Object.entries((st && st.places) || {})) {
+    const { live, reason } = isLive(rec, probe);
+    if (live === false) out.push({ path: key, rec, reason });
+  }
+  return out;
+}
+
+/** Marker files/directories that mean "this ancestor is a file-sync root" — heuristic, not exhaustive. */
+const SYNC_MARKERS = [
+  '.sync', // Resilio Sync
+  '.stfolder', // Syncthing
+  '.dropbox', // Dropbox (legacy marker; newer clients vary)
+];
+
+function hasSyncMarker(dir) {
+  for (const m of SYNC_MARKERS) {
+    try {
+      if (fs.existsSync(path.join(dir, m))) return m;
+    } catch (_) { /* unreadable — not evidence either way */ }
+  }
+  try {
+    for (const entry of fs.readdirSync(dir)) {
+      if (/^\.sync-conflict-/.test(entry) || /\.!sync$/.test(entry)) return entry;
+    }
+  } catch (_) { /* ignore */ }
+  return null;
+}
+
+/**
+ * Is `colabDir` (normally ~/.colab) sitting under a file-synced location? Walks ancestors up to
+ * `$HOME`, since a sync root is commonly declared a level or two above the folder itself (e.g.
+ * `~/.colab` living inside a synced `~` on a misconfigured machine, or a sync client's marker
+ * appearing beside the folder it manages rather than inside it). Returns a problem string, or
+ * `null` for clean ground. iCloud's "Library/Mobile Documents" convention is checked by substring
+ * on the path itself, since iCloud drops no marker file inside an arbitrary synced folder.
+ */
+function syncedStateProblem(colabDir) {
+  const resolved = path.resolve(colabDir);
+  const degradeInstruction = 'Degrading: fall back to a worktree + branch, which needs no lock ' +
+    '(CONVENTIONS.md, Place-claims — "serial falls back to isolated, never to unlocked").';
+  if (/Library\/Mobile Documents/.test(resolved)) {
+    return `${colabDir} is under iCloud Drive ("Library/Mobile Documents") — a place-claim must never ` +
+      'live in a file-synced location (CONVENTIONS.md "Place-claims"): no atomicity, no consistency ' +
+      `guarantee inside the sync window, and two sessions could each read "unlocked" with confidence. ` +
+      degradeInstruction;
+  }
+  const home = path.resolve(os.homedir());
+  let dir = resolved;
+  for (let i = 0; i < 8 && dir.length >= home.length; i++) {
+    const marker = hasSyncMarker(dir);
+    if (marker) {
+      return `${colabDir} appears to be under a file-synced directory (found "${marker}" in ${dir}) — a ` +
+        'place-claim must never live in a file-synced location (CONVENTIONS.md "Place-claims"): no ' +
+        'atomicity, no consistency guarantee inside the sync window, and two sessions could each read ' +
+        `"unlocked" with confidence. ${degradeInstruction}`;
+    }
+    if (dir === home) break;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+module.exports = {
+  placeKey, holdRecord, defaultProbe, isLive, holderOf, conflict, stalePlaces,
+  syncedStateProblem,
+};

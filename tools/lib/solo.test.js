@@ -16,7 +16,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const { unpushedBranches, fullyDirty, entryProblems, exitProblems } = require('./solo.js');
+const { unpushedBranches, fullyDirty, entryProblems, exitProblems, writesMode, soloEligibility, branchMandatory } = require('./solo.js');
 
 // --- fixture builder --------------------------------------------------------
 
@@ -176,4 +176,74 @@ test('fullyDirty: counts untracked AND tracked changes, unlike git.js dirtyTrack
   r.write('untracked.txt', 'x\n');
   r.write('README', 'base\nedited\n');
   assert.strictEqual(fullyDirty(r.dir).length, 2);
+});
+
+// --- writesMode (#133) --------------------------------------------------------
+
+test('writesMode: omission defaults to isolated', () => {
+  assert.strictEqual(writesMode({}), 'isolated');
+  assert.strictEqual(writesMode(null), 'isolated');
+});
+
+test('writesMode: writes: serial reads as serial', () => {
+  assert.strictEqual(writesMode({ writes: 'serial' }), 'serial');
+});
+
+test('writesMode: an unrecognised value fails closed to isolated, not serial', () => {
+  assert.strictEqual(writesMode({ writes: 'bogus' }), 'isolated');
+  assert.strictEqual(writesMode({ writes: 'ISOLATED' }), 'isolated'); // case-sensitive, fails closed
+});
+
+// --- soloEligibility (#133) ---------------------------------------------------
+
+test('soloEligibility: writes: serial is eligible via "writes"', () => {
+  assert.deepStrictEqual(soloEligibility({ writes: 'serial' }), { ok: true, via: 'writes' });
+});
+
+test('soloEligibility: legacy ceremony: light is eligible via "ceremony-legacy"', () => {
+  assert.deepStrictEqual(soloEligibility({ ceremony: 'light' }), { ok: true, via: 'ceremony-legacy' });
+});
+
+test('soloEligibility: both set — writes wins the "via" label, still eligible', () => {
+  const r = soloEligibility({ writes: 'serial', ceremony: 'light' });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.via, 'writes');
+});
+
+test('soloEligibility: neither set refuses with a reason', () => {
+  const r = soloEligibility({});
+  assert.strictEqual(r.ok, false);
+  assert.match(r.reason, /writes: serial/);
+});
+
+// --- branchMandatory (#133) ---------------------------------------------------
+
+test('branchMandatory: one unit in flight — not mandatory, condition 2 stays null (not false)', () => {
+  const st = { worktrees: { w1: { repo: '/r' } }, claims: {} };
+  const r = branchMandatory(st, '/r');
+  assert.strictEqual(r.mandatory, false);
+  const c1 = r.conditions.find((c) => c.id === 'units-in-flight');
+  const c2 = r.conditions.find((c) => c.id === 'pre-merge-gate');
+  assert.strictEqual(c1.met, false);
+  assert.strictEqual(c2.met, null); // never false — "cannot tell" must not read as "cannot apply"
+});
+
+test('branchMandatory: two units in flight (worktree + claim) — mandatory, names the condition', () => {
+  const st = { worktrees: { w1: { repo: '/r' } }, claims: { '/r#5': { issue: 5 } } };
+  const r = branchMandatory(st, '/r');
+  assert.strictEqual(r.mandatory, true);
+  const c1 = r.conditions.find((c) => c.id === 'units-in-flight');
+  assert.strictEqual(c1.met, true);
+  assert.match(c1.why, /2 units in flight/);
+});
+
+test('branchMandatory: a live place-claim counts as a unit too', () => {
+  const st = { worktrees: {}, claims: {}, places: { '/r': { repo: '/r' }, '/other': { repo: '/r' } } };
+  const r = branchMandatory(st, '/r');
+  assert.strictEqual(r.mandatory, true);
+});
+
+test('branchMandatory: zero units — not mandatory (an empty repo has no writer to conflict with)', () => {
+  const r = branchMandatory({ worktrees: {}, claims: {} }, '/r');
+  assert.strictEqual(r.mandatory, false);
 });

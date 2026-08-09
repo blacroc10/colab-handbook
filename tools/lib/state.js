@@ -33,6 +33,9 @@
  *   },
  *   solo: {                              // `ceremony: light` only — one lock per repo per machine
  *     "<repoAbs>": { host, session, sessionName, since }
+ *   },
+ *   places: {                            // #136 — path-scoped place-claims, machine-local only
+ *     "<checkoutPathAbs>": { path, repo, branch, host, session, sessionName, pid, since }
  *   }
  * }
  *
@@ -55,6 +58,16 @@
  * no claim and creates no worktree, so it needs its own lock or two solo sessions on one machine
  * could commit to the same trunk checkout at once with nothing recording either. `colab solo`
  * is the only writer; `--done` is the only remover.
+ *
+ * `places` is keyed by absolute checkout PATH, not by repo or issue (CONVENTIONS.md, Place-claims;
+ * lib/place.js) — a repo running several worktrees needs one hold per checkout in use, not one per
+ * repo. `pid` is optional (a hold acquired by a process other than the one whose liveness matters
+ * may omit it) but its absence makes the hold's liveness `unknown`, which FAILS CLOSED (the hold
+ * stands) rather than reading as released. Nothing here is ever read as "released" from a stored
+ * flag — every reader re-derives liveness at read time (lib/place.js `isLive`); a record surviving
+ * past its holder's death is the expected, harmless shape, not a bug to migrate away. `places` and
+ * `solo` deliberately coexist rather than merge: `solo` is the published contract noted above, and
+ * converging the two is out of scope for #133/#136 (tracked for after #175).
  */
 
 const fs = require('fs');
@@ -99,7 +112,7 @@ function ensureDir() {
 }
 
 function emptyState() {
-  return { version: STATE_VERSION, worktrees: {}, claims: {}, ports: {}, solo: {} };
+  return { version: STATE_VERSION, worktrees: {}, claims: {}, ports: {}, solo: {}, places: {} };
 }
 
 function loadConfig() {
@@ -135,6 +148,7 @@ function migrate(st) {
   st.claims = st.claims || {};
   st.ports = st.ports || {};
   st.solo = st.solo || {};
+  st.places = st.places || {};
   // Future migrations key off st.version here.
   return st;
 }

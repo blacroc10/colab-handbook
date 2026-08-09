@@ -643,6 +643,11 @@ const VALID_DEPLOY = new Set(["tag", "manual", "push-main", "none"]);
 // history on; the two coherence rules below keep it from drifting onto a repo where that is
 // no longer true (project.schema.md "ceremony — optional").
 const VALID_CEREMONY = new Set(["standard", "light"]);
+
+// `writes` names which write-conflict prevention method a repo's sessions default to —
+// a separate axis from both `tier` and `ceremony` (project.schema.md "writes — optional").
+// Omission means "isolated", the fleet's status quo, so an unset key changes no behavior.
+const VALID_WRITES = new Set(["isolated", "serial"]);
 // `deploy` answers HOW a repo reaches production, never WHETHER it is tier A — the tier
 // test is "does a deploy target exist today?". `manual` describes the honest third case:
 // production exists, but shipping is a human running a documented runbook (rsync, compose
@@ -726,6 +731,13 @@ function auditRepo(target, ctx) {
         fail(`ceremony: light is incompatible with autonomy: auto-trunk — an unattended merge with no evidence trail is a closure nobody can audit. Keep autonomy: auto-trunk and use ceremony: standard, or drop autonomy to manual`);
       }
     }
+
+    // ---- writes axis (#133) --------------------------------------------------
+    // Deliberately NOT coupled to tier/production/exposure — see CONVENTIONS.md §2 and
+    // project.schema.md. If you are reading this while adding an exposure key (#132), the
+    // ceremony/production coherence block above is yours to move; this block is not.
+    const writesRaw = "writes" in (cfg || {}) ? cfg.writes : null;
+    if (writesRaw !== null && !VALID_WRITES.has(writesRaw)) fail(`writes is ${JSON.stringify(writesRaw)}, expected "isolated" or "serial" (omit for isolated)`);
 
     // ---- tier <-> trunk coherence ------------------------------------------
     // The canonical Tier A shape is the dev/main split — sessions land on dev, main is the release

@@ -26,6 +26,7 @@ const records = require('./lib/records');
 const teardown = require('./lib/teardown');
 const orphanLib = require('./lib/orphan-worktree');
 const solo = require('./lib/solo');
+const place = require('./lib/place');
 const checklist = require('./lib/checklist');
 const groupLabels = require('./lib/group-labels');
 const shipguard = require('./lib/shipguard');
@@ -483,8 +484,24 @@ function cmdClaim(argv) {
   const gh = isGhUsable(repoAbs);
   const myLogin = gh ? git.ghCurrentLogin() : null;
 
+  // #133/#136: a claim with NO worktree is the trunk-checkout shape — on a `writes: serial` repo
+  // that is condition 1's unit (CONVENTIONS.md §2, "Writes"), so a second one already in flight
+  // makes a place-claim conflict, and it is refused here the same way a worktree/issue conflict is
+  // below — before the mutate, never after. Computed BEFORE the state read so a read failure can
+  // be attributed correctly (place-claim-aware degrade vs. the ordinary claim path, below).
+  const doc0 = projectDoc(repoAbs);
+  const takingPlace = !wtName && solo.writesMode(doc0) === 'serial';
+
   // ---- REFUSAL (two layers, check-then-refuse) ----
-  const localConf = localClaimConflicts(state.loadState(), repoAbs, nums, wtName);
+  let st0;
+  if (takingPlace) {
+    const loaded = placeState('claiming the trunk checkout');
+    if (!loaded.ok) { print(`✗ ${loaded.message}`); return 1; }
+    st0 = loaded.st;
+  } else {
+    st0 = state.loadState(); // unchanged from before this branch — not a place-claim read
+  }
+  const localConf = localClaimConflicts(st0, repoAbs, nums, wtName);
   const ghConf = gh ? ghClaimConflicts(repoAbs, nums, myLogin) : [];
   if (!gh) warn('gh not usable here (no gh auth or no origin remote) — refusal is LOCAL-ONLY');
   if ((localConf.length || ghConf.length)) {
@@ -492,25 +509,75 @@ function cmdClaim(argv) {
     printTakeover(localConf, ghConf);
   }
 
+  if (takingPlace) {
+    // Never acquired from a file-synced location (CONVENTIONS.md, Place-claims) — the same guard
+    // `cmdPlace acquire` runs; this is the trunk-checkout claim's equivalent write site.
+    const syncProblem = place.syncedStateProblem(state.COLAB_DIR);
+    if (syncProblem) throw new UserError(syncProblem);
+
+    const placeConf = place.conflict(st0, repoAbs, { session });
+    if (placeConf) {
+      if (!opts.force) {
+        // Wired to the structure built to guarantee this, not a hand-written string (ship-grade
+        // remainder on #133/#136: `branchMandatory` was exported, tested, and never called).
+        // `st0` predates THIS claim landing, so its own unit count is one short of what adding it
+        // would make true — the live holder `placeConf` already proves is exactly the "+1" that
+        // tips condition 1, which is why this refusal fires at all.
+        const bm = solo.branchMandatory(st0, repoAbs);
+        const unitsCond = bm.conditions.find((c) => c.id === 'units-in-flight');
+        throw new UserError(`${placeConf.message} — a branch is now mandatory once this claim lands ` +
+          `(${unitsCond.why}, plus this attempt; CONVENTIONS.md §2, "Writes"). ` +
+          `Use \`colab claim --worktree\` instead.`);
+      }
+      // `--force` taking over a LIVE place-claim is exactly what `cmdPlace acquire --force` gates
+      // on COLAB_HUMAN=1 (CONVENTIONS.md, Place-claims: "override is a human act") — this is the
+      // second entry path that can take the same action and it must clear the same bar. Demonstrated
+      // missing at ship-grade: `colab claim --force` silently stole a live hold, exit 0, no warning.
+      if (process.env.COLAB_HUMAN !== '1') {
+        throw new UserError(`--force would take over a live place-claim held by a different session — ` +
+          `this requires a human: re-run with COLAB_HUMAN=1. (No field, flag or project.yml value can ` +
+          `lower this bar — CONVENTIONS.md, Place-claims. Matches \`colab place acquire --force\`.)`);
+      }
+    }
+  }
+
   // ---- claim locally (idempotent on same worktree; --force overwrites a different holder) ----
-  const res = state.mutate((st) => {
-    if (wtName && !st.worktrees[wtName]) {
-      // A stub for a worktree that will be created later. It exists so the claim is not read as an
-      // orphan; `colab worktree new` overwrites it with the real record. `status: pending` is what
-      // makes the null path HONEST rather than a record claiming a directory it does not have —
-      // doctor knows the difference, and a stub that never becomes a worktree is reported as drift.
-      st.worktrees[wtName] = { name: wtName, repo: repoAbs, branch, path: null, ports: [], host: HOST, session, sessionName, status: records.PENDING, created: nowISO() };
+  let res;
+  try {
+    res = state.mutate((st) => {
+      if (takingPlace) {
+        st.places = st.places || {};
+        st.places[place.placeKey(repoAbs)] = place.holdRecord({
+          pathAbs: repoAbs, repo: repoAbs, branch: null, host: HOST, session, sessionName, pid: process.ppid,
+        });
+      }
+      if (wtName && !st.worktrees[wtName]) {
+        // A stub for a worktree that will be created later. It exists so the claim is not read as
+        // an orphan; `colab worktree new` overwrites it with the real record. `status: pending` is
+        // what makes the null path HONEST rather than a record claiming a directory it does not
+        // have — doctor knows the difference, and a stub that never becomes a worktree is reported
+        // as drift.
+        st.worktrees[wtName] = { name: wtName, repo: repoAbs, branch, path: null, ports: [], host: HOST, session, sessionName, status: records.PENDING, created: nowISO() };
+      }
+      const created = [], reclaimed = [];
+      for (const num of nums) {
+        const key = claimKey(repoAbs, num);
+        const ex = st.claims[key];
+        if (ex && (ex.worktree || null) === (wtName || null)) { reclaimed.push(num); continue; } // idempotent
+        st.claims[key] = { issue: issueTag(num), repo: repoAbs, worktree: wtName, branch, host: HOST, session, sessionName, created: nowISO() };
+        created.push(num);
+      }
+      return { created, reclaimed };
+    });
+  } catch (e) {
+    if (takingPlace) {
+      print(`✗ place-claim state write is unreachable (${String(e.message).split('\n')[0]}) — degrading: ` +
+        `claiming the trunk checkout refused. Fall back to a worktree + branch, which needs no lock ` +
+        '(CONVENTIONS.md, Place-claims).');
+      return 1;
     }
-    const created = [], reclaimed = [];
-    for (const num of nums) {
-      const key = claimKey(repoAbs, num);
-      const ex = st.claims[key];
-      if (ex && (ex.worktree || null) === (wtName || null)) { reclaimed.push(num); continue; } // idempotent
-      st.claims[key] = { issue: issueTag(num), repo: repoAbs, worktree: wtName, branch, host: HOST, session, sessionName, created: nowISO() };
-      created.push(num);
-    }
-    return { created, reclaimed };
-  });
+    throw e; // not a place-claim write — unchanged behaviour from before this branch
+  }
 
   for (const num of res.reclaimed) print(`#${num} already claimed by this worktree — OK (idempotent)`);
 
@@ -730,9 +797,10 @@ function cmdGateRecorded(argv) {
 const HELP_SOLO = `colab solo [--repo <path>] [--force] [--session <url>] [--session-name <name>]
 colab solo --done [--repo <path>]
 
-Entry gate for solo flow (CONVENTIONS.md, Solo flow) — legal ONLY on a \`ceremony: light\` repo.
-Trunk-direct commits with no pre-filed issue, claim or worktree are safe exactly when nobody
-else could be colliding with them; this command checks that mechanically instead of trusting it.
+Entry gate for solo flow (CONVENTIONS.md, Solo flow) — legal on a \`writes: serial\` repo, or,
+legacy, a \`ceremony: light\` one (#175 will retire the legacy path). Trunk-direct commits with
+no pre-filed issue, claim or worktree are safe exactly when nobody else could be colliding with
+them; this command checks that mechanically instead of trusting it.
 
   colab solo            check + LOCK: no live solo session, no worktree, no claim, checked out
                          on trunk, no unpushed branch anywhere, clean tree. Any one held → refuse,
@@ -745,6 +813,43 @@ Not honor system: nothing here is read once and cached — every check re-derive
 git and ~/.colab/state.json on this invocation. The lock is machine-local, one repo at a time.
 `;
 
+/**
+ * Load ~/.colab/state.json for a place-claim-aware caller (`cmdSolo`, `cmdClaim`'s trunk-checkout
+ * path, `cmdPlace`), translating an unreadable state file into the DEGRADED outcome
+ * CONVENTIONS.md's Place-claims section promises — "serial falls back to isolated, never to
+ * unlocked" — instead of letting `state.loadState()`'s raw parse error surface as a stack trace.
+ * Every place-claim-touching caller goes through this, so a corrupt state file degrades the same
+ * way everywhere: refuse whatever was being attempted and name the escape hatch that needs no
+ * lock at all (a worktree + branch).
+ */
+function placeState(actionLabel) {
+  try {
+    return { ok: true, st: state.loadState() };
+  } catch (e) {
+    return {
+      ok: false,
+      message: `place-claim state is unreachable (${String(e.message).split('\n')[0]}) — degrading: ` +
+        `${actionLabel} refused. Fall back to a worktree + branch, which needs no lock ` +
+        '(CONVENTIONS.md, Place-claims).',
+    };
+  }
+}
+
+/** Same degrade framing as `placeState`, for the write side — a stuck lock directory is the other
+ * "cannot reach the lock" case CONVENTIONS.md names alongside an unreadable state file. */
+function placeMutate(actionLabel, fn) {
+  try {
+    return { ok: true, result: state.mutate(fn) };
+  } catch (e) {
+    return {
+      ok: false,
+      message: `place-claim state write is unreachable (${String(e.message).split('\n')[0]}) — degrading: ` +
+        `${actionLabel} refused. Fall back to a worktree + branch, which needs no lock ` +
+        '(CONVENTIONS.md, Place-claims).',
+    };
+  }
+}
+
 function cmdSolo(argv) {
   const opts = parseArgs(argv, {
     values: { '--repo': 'repo', '--session': 'session', '--session-name': 'sessionName' },
@@ -753,15 +858,19 @@ function cmdSolo(argv) {
   if (opts.help) return print(HELP_SOLO);
   const repoAbs = resolveRepo(opts);
   const doc = projectDoc(repoAbs);
-  if (doc.ceremony !== 'light') {
-    throw new UserError(`solo flow requires \`ceremony: light\` in .github/project.yml — this repo ` +
-      `is ${doc.ceremony ? `\`ceremony: ${doc.ceremony}\`` : 'unset (standard)'}. Full ceremony applies ` +
-      `(CONVENTIONS.md, Solo flow).`);
-  }
+  // #133 re-keys this gate onto `writes: serial`. `ceremony: light` is still accepted, as a
+  // LEGACY proxy only, because no repo has answered the writes question yet and removing it here
+  // would break every light repo on the same commit that introduces its replacement. #175
+  // (blocked on #133) removes this legacy clause and the ceremony/production coherence rule. Do
+  // not add a third acceptance path.
+  const eligibility = solo.soloEligibility(doc);
+  if (!eligibility.ok) throw new UserError(`${eligibility.reason} (CONVENTIONS.md, Solo flow).`);
 
   if (opts.done) return cmdSoloDone(repoAbs, doc);
 
-  const st = state.loadState();
+  const loaded = placeState('opening solo flow');
+  if (!loaded.ok) { print(`✗ ${loaded.message}`); return 1; }
+  const st = loaded.st;
   const held = (st.solo || {})[repoAbs];
   if (held && !opts.force) {
     print(`✗ solo already OPEN in ${shortRepo(repoAbs)} — held by ${held.host}` +
@@ -773,20 +882,39 @@ function cmdSolo(argv) {
 
   const trunk = resolveTrunk(repoAbs, doc);
   const problems = solo.entryProblems(st, repoAbs, trunk);
+  // A live place-claim on this checkout (someone else already writing here right now, outside
+  // solo flow's own lock) refuses entry too — rule 1 of Solo flow gains this check (#136).
+  const placeConf = place.conflict(st, repoAbs, { session: resolveSession(opts) });
+  if (placeConf) problems.push(placeConf.message);
   if (problems.length) {
     print(`✗ solo refused in ${shortRepo(repoAbs)} — full ceremony required:`);
     for (const p of problems) print(`  - ${p}`);
     return 1;
   }
 
+  // Never acquired from a file-synced location (CONVENTIONS.md, Place-claims) — the same guard
+  // `cmdPlace acquire` runs, applied here too since this is the OTHER write site that creates a
+  // place record from scratch (#133/#136 ship-grade remainder: this guarded 1 of 4 write sites).
+  const syncProblem = place.syncedStateProblem(state.COLAB_DIR);
+  if (syncProblem) throw new UserError(syncProblem);
+
   const session = resolveSession(opts);
   const sessionName = resolveSessionName(opts);
   warnHalfIdentity(session, sessionName, 'solo lock', null);
 
-  state.mutate((s) => {
+  const written = placeMutate('opening solo flow', (s) => {
     s.solo = s.solo || {};
     s.solo[repoAbs] = { host: HOST, session, sessionName, since: nowISO() };
+    // Written ALONGSIDE `solo`, not instead of it — `solo` is a published state contract with an
+    // external reader (lib/state.js header); converging the two records is post-#175 work. The
+    // place-claim is what a writer OTHER than colab's own solo gate can verify (`colab place
+    // check`) — the thing solo's own `held` check above cannot offer a coordinator-spawned agent.
+    s.places = s.places || {};
+    s.places[place.placeKey(repoAbs)] = place.holdRecord({
+      pathAbs: repoAbs, repo: repoAbs, branch: null, host: HOST, session, sessionName, pid: process.ppid,
+    });
   });
+  if (!written.ok) { print(`✗ ${written.message}`); return 1; }
 
   // No pushEvent here: `solo` is not in notify.js's ACTION_KIND (closed vocabulary, agreed with the
   // receiver per action — same reasoning as readiness's commented-out emission, #45/#46). This lock
@@ -813,8 +941,140 @@ function cmdSoloDone(repoAbs, doc) {
 
   state.mutate((s) => {
     if (s.solo) delete s.solo[repoAbs];
+    // Courtesy release, never a correctness dependency — readers must not trust deletion, which is
+    // the whole point of read-time liveness (CONVENTIONS.md, Place-claims).
+    if (s.places) delete s.places[place.placeKey(repoAbs)];
   });
   print(`✓ solo flow CLOSED in ${shortRepo(repoAbs)} — tree clean, pushed, lock released.`);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// place — the writer-verifiable checkout hold `writes: serial` needs (#136)
+// ---------------------------------------------------------------------------
+
+const HELP_PLACE = `colab place <acquire|check|release> <path> [--repo P] [--session URL] [--session-name N] [--force]
+
+Path-scoped, machine-local hold on ONE checkout (CONVENTIONS.md, Place-claims) — what
+\`writes: serial\` needs and \`writes: isolated\` (worktrees) does not. Not repo-scoped: a
+repo running several worktrees needs one hold per checkout in use.
+
+  colab place acquire <path>   take the hold. Same exit scheme as \`check\` below on a refusal
+                                (exit 1 held-by-a-live-other, exit 2 liveness-unknown-or-degraded).
+                                A dead holder's record is silently superseded — no --force needed.
+                                --force on a LIVE other holder requires COLAB_HUMAN=1 (below).
+  colab place check <path>     exit 0 = free or held by you · exit 1 = held by a live other ·
+                                exit 2 = liveness unknown, or the lock itself is unreachable
+                                (degraded — fall back to a worktree + branch, which needs no lock)
+  colab place release <path>   release your own hold. Releasing someone else's requires
+                                COLAB_HUMAN=1 (the same bar as a migration grant or a promotion) —
+                                a held place-claim with a live holder is a genuine refusal, not
+                                friction to route around.
+
+\`colab claim\` on a \`writes: serial\` repo with no --worktree takes/checks this SAME hold on the
+trunk checkout — its \`--force\` over a live other holder is gated by the identical COLAB_HUMAN=1
+bar as \`place acquire --force\` above; there is only one override rule, enforced at both entry
+points that can trigger it.
+
+Never acquired from a file-synced location (Resilio/Syncthing/Dropbox/iCloud) — refuses outright;
+a lock with no atomicity inside a sync window is worse than no lock (both sides read "unlocked"
+with confidence). Release is a LIVENESS LOOKUP AT READ TIME, never a state transition written at
+kill time — nothing here trusts a stored "released" flag; every check re-derives it.
+`;
+
+function cmdPlace(argv) {
+  const sub = argv[0];
+  const rest = argv.slice(1);
+  const opts = parseArgs(rest, {
+    values: { '--repo': 'repo', '--session': 'session', '--session-name': 'sessionName' },
+    flags: { '--force': 'force', '-h': 'help', '--help': 'help' },
+  });
+  if (opts.help || !sub || opts._.length === 0) return print(HELP_PLACE);
+  const pathAbs = path.resolve(opts._[0]);
+  const repoAbs = opts.repo ? resolveRepo(opts) : (git.repoRoot(pathAbs) || pathAbs);
+
+  const syncProblem = place.syncedStateProblem(state.COLAB_DIR);
+  if (syncProblem && (sub === 'acquire')) throw new UserError(syncProblem);
+
+  const session = resolveSession(opts);
+  const sessionName = resolveSessionName(opts);
+
+  if (sub === 'check') {
+    const loaded = placeState('check');
+    if (!loaded.ok) { print(`✗ ${loaded.message}`); return 2; }
+    const c = place.conflict(loaded.st, pathAbs, { session });
+    if (!c) { print(`✓ "${pathAbs}" is free (or held by you).`); return 0; }
+    print(`✗ ${c.message}`);
+    return c.kind === 'unknown' ? 2 : 1;
+  }
+
+  if (sub === 'acquire') {
+    const loaded = placeState('acquire');
+    if (!loaded.ok) { print(`✗ ${loaded.message}`); return 2; }
+    const c = place.conflict(loaded.st, pathAbs, { session });
+    if (c && !opts.force) { print(`✗ ${c.message}`); return c.kind === 'unknown' ? 2 : 1; }
+    if (c && opts.force && process.env.COLAB_HUMAN !== '1') {
+      throw new UserError(`--force on a held place-claim requires a human: re-run with COLAB_HUMAN=1. ` +
+        `(No field, flag or project.yml value can lower this bar — CONVENTIONS.md, Place-claims.)`);
+    }
+    warnHalfIdentity(session, sessionName, 'place-claim', null);
+    // `process.ppid`, deliberately not `process.pid`: `colab` is a short-lived CLI invocation that
+    // exits the moment this command returns, so its OWN pid is already dead by the time anyone
+    // else checks the hold — which would make every acquire read as immediately stale. The PARENT
+    // process (the shell/session runtime that invoked `colab`) is the thing whose liveness this
+    // hold actually needs to track; it outlives this one invocation the way the hold is meant to.
+    const written = placeMutate('acquire', (s) => {
+      s.places = s.places || {};
+      s.places[place.placeKey(pathAbs)] = place.holdRecord({
+        pathAbs, repo: repoAbs, branch: opts.repo ? null : null, host: HOST, session, sessionName, pid: process.ppid,
+      });
+    });
+    if (!written.ok) { print(`✗ ${written.message}`); return 2; }
+    print(`✓ place-claim acquired on "${pathAbs}".`);
+    return 0;
+  }
+
+  if (sub === 'release') {
+    const loaded = placeState('release');
+    if (!loaded.ok) { print(`✗ ${loaded.message}`); return 2; }
+    const key = place.placeKey(pathAbs);
+    const rec = (loaded.st.places || {})[key];
+    if (!rec) { print(`Nothing held at "${pathAbs}" — nothing to release.`); return 0; }
+    const mine = session && rec.session === session;
+    if (!mine && process.env.COLAB_HUMAN !== '1') {
+      throw new UserError(`"${pathAbs}" is held by a different session ("${rec.sessionName || rec.session || 'unknown'}") — ` +
+        `releasing it requires a human: re-run with COLAB_HUMAN=1. (No field, flag or project.yml value can lower this bar.)`);
+    }
+    const written = placeMutate('release', (s) => { if (s.places) delete s.places[key]; });
+    if (!written.ok) { print(`✗ ${written.message}`); return 2; }
+    print(`✓ place-claim released on "${pathAbs}".`);
+    return 0;
+  }
+
+  return print(HELP_PLACE);
+}
+
+const HELP_PLACES = `colab places [--json]
+
+List every place-claim recorded on this machine, with liveness resolved right now (never a
+cached/stored flag — CONVENTIONS.md, Place-claims).
+`;
+
+function cmdPlaces(argv) {
+  const opts = parseArgs(argv, { flags: { '--json': 'json', '-h': 'help', '--help': 'help' } });
+  if (opts.help) return print(HELP_PLACES);
+  const st = state.loadState();
+  const rows = Object.entries(st.places || {}).map(([key, rec]) => {
+    const { live, reason } = place.isLive(rec);
+    return { path: key, repo: rec.repo, branch: rec.branch, host: rec.host, session: rec.session,
+      sessionName: rec.sessionName, since: rec.since, live, reason };
+  });
+  if (opts.json) return print(JSON.stringify(rows, null, 2));
+  if (!rows.length) { print('No place-claims recorded on this machine.'); return 0; }
+  for (const r of rows) {
+    const liveTxt = r.live === true ? 'live' : r.live === false ? 'DEAD' : 'unknown';
+    print(`${r.path}  [${liveTxt}]  ${displayIdentity(r.sessionName, r.session) || '-'}  since ${r.since}`);
+  }
   return 0;
 }
 
@@ -2259,6 +2519,14 @@ function cmdWorktreeNew(argv) {
       `(git branch -D ${branch} / git push origin --delete ${branch}), then re-run this command.`);
   }
 
+  // Never acquired from a file-synced location (CONVENTIONS.md, Place-claims) — the same guard
+  // `cmdPlace acquire` and `cmdSolo` run, checked BEFORE step 1 creates anything on disk (unlike
+  // the other two, this write site has a git worktree to avoid leaving orphaned). This is the
+  // third of four write sites that create a place record from scratch (the fourth, `cmdRelease`,
+  // only ever deletes one).
+  const syncProblem = place.syncedStateProblem(state.COLAB_DIR);
+  if (syncProblem) throw new UserError(syncProblem);
+
   // 1. fetch + create worktree
   print(`fetch origin/${base} + create worktree "${name}" (branch ${branch})`);
   const fetch = git.git(['fetch', 'origin', base], repoAbs);
@@ -2304,6 +2572,14 @@ function cmdWorktreeNew(argv) {
     // "cut before bases existed", and only a written value says the first.
     st.worktrees[name] = { name, repo: repoAbs, branch, base, path: wtPath, ports: chosenPorts, host: HOST, session, sessionName, status: 'running', created: nowISO() };
     for (const p of chosenPorts) st.ports[String(p)] = { port: p, owner: { type: 'worktree', ref: name }, host: HOST, created: nowISO() };
+    // Creating a worktree IS taking it (CONVENTIONS.md, Place-claims — "creating it is taking it;
+    // there is no separate act"). Recording the hold here closes that gap for every new worktree,
+    // not just `writes: serial` repos — it is what makes "worktree held by no session" impossible
+    // for anything created from this point on.
+    st.places = st.places || {};
+    st.places[place.placeKey(wtPath)] = place.holdRecord({
+      pathAbs: wtPath, repo: repoAbs, branch, host: HOST, session, sessionName, pid: process.ppid,
+    });
     const claimedNums = [], dupes = [];
     for (const num of issues) {
       const key = claimKey(repoAbs, num);
@@ -2466,6 +2742,10 @@ function cmdWorktreeRm(argv) {
     const freedPorts = Object.keys(st.ports).filter((p) => st.ports[p].owner.type === 'worktree' && st.ports[p].owner.ref === name);
     for (const p of freedPorts) delete st.ports[p];
     delete st.worktrees[name];
+    // Courtesy release, never a correctness dependency (CONVENTIONS.md, Place-claims) — a place
+    // record surviving teardown is harmless: its liveness will read `false` (pid gone) the moment
+    // anyone next checks it.
+    if (st.places && wt.path) delete st.places[place.placeKey(wt.path)];
     return { claims: deleted, freedPorts };
   });
 
@@ -2912,7 +3192,7 @@ function cmdDoctor(argv) {
   const config = state.loadConfig();
   const ttl = opts.ttl ? parseFloat(opts.ttl) : config.claimTTLHours;
 
-  const report = { deadWorktrees: [], orphanClaims: [], staleClaims: [], orphanPorts: [], brokenRecords: [], prunedPorts: [],
+  const report = { deadWorktrees: [], orphanClaims: [], staleClaims: [], stalePlaces: [], orphanPorts: [], brokenRecords: [], prunedPorts: [],
     mergedFlips: [], mergedSweep: [], mergedDirty: [], mergedHookFail: [], mergedRemoveFail: [], shippedBranches: [], ghostPorts: [],
     spentGroupLabels: [], groupLabelsChecked: !!opts.sync, pruned: !!opts.prune };
 
@@ -2960,6 +3240,16 @@ function cmdDoctor(argv) {
         for (const p of wt.ports) { delete st.ports[String(p)]; report.prunedPorts.push(p); }
         delete st.worktrees[wt.name];
       }
+    }
+    // 1b. stale place-claims (#136) — a hold whose recorded pid is confirmed dead. Deliberately
+    // uses the SAME liveness-at-read-time check every other consumer does (lib/place.js
+    // `stalePlaces`), never a separate heuristic: `unknown` liveness (no pid recorded) is NEVER
+    // reported here, because a record this check cannot disprove is held must not read as
+    // "safe to prune" (courtesy release only — CONVENTIONS.md, Place-claims).
+    for (const stale of place.stalePlaces(st)) {
+      report.stalePlaces.push({ path: stale.path, repo: shortRepo(stale.rec.repo), reason: stale.reason,
+        session: stale.rec.session || '', sessionName: stale.rec.sessionName || '' });
+      if (opts.prune) delete st.places[stale.path];
     }
     // 2. orphan claims (worktree ref not in state)
     for (const [k, c] of Object.entries(st.claims)) {
@@ -3217,6 +3507,11 @@ function cmdDoctor(argv) {
     }
     if (!opts.prune) print('  (worktree-less claims are not auto-removed — re-run with --prune to remove)');
   }
+  if (report.stalePlaces.length) {
+    print(`${opts.prune ? 'Pruned' : 'Flagged'} ${report.stalePlaces.length} stale place-claim(s) (holder confirmed dead):`);
+    for (const p of report.stalePlaces) print(`  ${p.path} [${p.repo}] ${p.reason}${displayIdentity(p.sessionName, p.session) ? ` session=${displayIdentity(p.sessionName, p.session)}` : ''}`);
+    if (!opts.prune) print('  (place-claims are not auto-removed — re-run with --prune to remove; a live/unknown hold is never listed here)');
+  }
   if (report.orphanPorts.length) {
     print(`${verb} ${report.orphanPorts.length} orphan port(s):`);
     for (const p of report.orphanPorts) print(`  ${p.port} owner=${p.owner}`);
@@ -3265,7 +3560,7 @@ function cmdDoctor(argv) {
   // Deliberately NOT part of the health verdict below. `ship` keeps branches by default, so one
   // accumulates per shipped session BY DESIGN — this is a routine maintenance list a human works
   // through when they feel like it, not drift, and not a sign anything went wrong.
-  const nothing = issues === 0 && report.staleClaims.length === 0 && report.orphanPorts.length === 0 &&
+  const nothing = issues === 0 && report.staleClaims.length === 0 && report.stalePlaces.length === 0 && report.orphanPorts.length === 0 &&
     report.brokenRecords.length === 0 &&
     report.mergedFlips.length === 0 && report.mergedSweep.length === 0 && report.mergedDirty.length === 0;
   if (nothing) print('All healthy — nothing to prune.');
@@ -6687,7 +6982,13 @@ Commands:
                                         code-wrap's A3 quality-gate step (#116) — no colab state
                                         written, no gh call of its own
   solo [--force] [--repo P] | solo --done [--repo P]                 entry-gated trunk-direct
-                                        flow, \`ceremony: light\` only — no issue/claim/worktree (#83)
+                                        flow, \`writes: serial\` (or legacy \`ceremony: light\`) only —
+                                        no issue/claim/worktree (#83)
+  place acquire|check|release <path> [--repo P] [--force]            writer-verifiable checkout
+                                        hold \`writes: serial\` needs (#136); release requires
+                                        COLAB_HUMAN=1 unless releasing your own
+  places [--json]                                                     list every place-claim, with
+                                        liveness resolved right now
   readiness <issue> [--clear] [--mechanical] [--repo P]              own the deps-checked / graph-empty markers (§5)
   migration-grant <issue> --branch B | --revoke | --list [--json]    human-only ship migration exemption (#98)
   decision <issue> --record --ruled-by N | --reopen --ruled-by N | --list [--json]
@@ -6760,6 +7061,8 @@ function main(argv) {
     case 'issue-filed': return cmdIssueFiled(rest);
     case 'gate-recorded': return cmdGateRecorded(rest);
     case 'solo': return cmdSolo(rest);
+    case 'place': return cmdPlace(rest);
+    case 'places': return cmdPlaces(rest);
     case 'readiness': return cmdReadiness(rest);
     case 'migration-grant': return cmdMigrationGrant(rest);
     case 'decision': return cmdDecision(rest);

@@ -365,8 +365,44 @@ backstop — the moment `production:` gains a URL the audit flags the pair.
 commits with no pre-filed issue, claim or worktree, entry-gated by `colab solo`. No new
 field: solo flow is a session-time *option* a light repo permits, not a repo-time state a
 descriptor declares, so there is nothing here for a repo to opt into beyond `light` itself.
-`colab solo` refuses outright on any repo that is not `ceremony: light` — see that section
-for the entry gate and the five rules it never relaxes.
+`colab solo` refuses outright on a repo that is neither `writes: serial` nor (legacy)
+`ceremony: light` — see that section for the entry gate and the five rules it never relaxes.
+
+### `writes` — optional
+
+```yaml
+writes: isolated   # default; omission = isolated — no existing repo changes behavior
+writes: serial      # one writer at a time in a place, under a place-claim
+```
+
+Which write-conflict prevention method this repo's sessions use, by default — a separate
+axis from `tier` (gates to production) and from `ceremony` (record-keeping depth). Three
+coherent methods exist: **serial trunk-direct** (one writer, no branch — solo flow is this
+cell), **serial gated** (one writer, still branches for a squash unit or a pre-merge gate),
+and **isolated** (worktrees, no shared mutable state — today's default and the vast
+majority of this fleet). A fourth cell — many units in flight, writing trunk-direct — is
+not a method; it is simply an unlocked repo, and is named incoherent
+(`CONVENTIONS.md` §2, *Writes*).
+
+`writes` says which of those a repo's sessions may use by default; it does **not** say
+whether any given unit of work branches — that stays a per-unit choice inside whichever
+method applies. Two conditions, and only two, make a branch mandatory on a `serial` repo:
+more than one unit in flight, or a gate that must inspect a unit before it lands. "It feels
+safer" is not on that list.
+
+**Deliberately not coupled to `tier`, `production`, or exposure.** A busy repo with three
+concurrent sessions needs isolation regardless of whether it has a production deploy; a
+quiet repo with one session at a time does not need it merely because it is live. The
+correlation seen across today's fleet is caused by *who works a repo*, not by *what
+consumes it* — encoding that correlation as a rule would repeat the same weld `ceremony`
+was introduced to undo. No coherence rule is audited against `tier`/`production` for this
+reason; do not add one.
+
+**No field for the place-claim itself.** The lock that enforces `writes: serial`
+(`CONVENTIONS.md`, *Solo flow* / place-claims) is a fact about one checkout on one
+machine at one moment — the same reasoning that keeps `deploys: {host: branch}` out of
+this schema ([§2](CONVENTIONS.md#2-tiers)) applies here: a path on one host is meaningless
+read from another, so it lives in session state (`~/.colab/state.json`), never in this file.
 
 ### `promotion` — optional
 
@@ -512,6 +548,7 @@ stack: laravel-inertia
 | `ceremony` ∈ {`standard`, `light`} when set | a misspelled value silently read as `standard` |
 | `ceremony: light` → `production: null` | a live repo opting out of its own audit trail |
 | `ceremony: light` → not `autonomy: auto-trunk` | an unattended merge with no evidence trail nobody can audit |
+| `writes` ∈ {`isolated`, `serial`} when set | a misspelled value silently read as `isolated` |
 
 `push-main` on a Tier A repo **is a finding** — a mismatch between the
 mechanism and the tier's contract, not a judgement on the mechanism, and the

@@ -125,21 +125,31 @@ function portIsBound(port) {
 }
 
 /**
+ * Is this pid alive right now? `kill(pid, 0)` sends no signal — it only asks the kernel whether
+ * the pid exists and is ours to signal. Extracted (#136) so callers other than `terminate` — the
+ * place-claim's read-time liveness check among them — share one implementation instead of each
+ * writing their own `try { kill(pid, 0) } catch` copy, which is exactly the duplication #86 was
+ * filed about for a different pair of functions in this same file.
+ */
+function alive(pid) {
+  try { process.kill(Number(pid), 0); return true; } catch (_) { return false; }
+}
+
+/**
  * Terminate a pid politely, then forcibly. Returns true if it is gone afterwards.
  * SIGTERM first so a dev server can close its listeners; SIGKILL only for what ignores it.
  */
 function terminate(pid, waitMs = 2000) {
-  const alive = () => { try { process.kill(Number(pid), 0); return true; } catch (_) { return false; } };
   try { process.kill(Number(pid), 'SIGTERM'); } catch (_) { return true; } // already gone
   const deadline = Date.now() + waitMs;
   while (Date.now() < deadline) {
-    if (!alive()) return true;
+    if (!alive(pid)) return true;
     // Busy-wait in 50ms slices: this runs at most a couple of seconds during teardown, and a
     // sync sleep keeps the whole command synchronous like the rest of the CLI.
     run('sleep', ['0.05']);
   }
   try { process.kill(Number(pid), 'SIGKILL'); } catch (_) { /* raced to exit */ }
-  return !alive();
+  return !alive(pid);
 }
 
-module.exports = { isInside, parseLsofCwd, listeningPorts, commandOf, cwdOf, processesInDir, listeners, portIsBound, terminate };
+module.exports = { isInside, parseLsofCwd, listeningPorts, commandOf, cwdOf, processesInDir, listeners, portIsBound, alive, terminate };

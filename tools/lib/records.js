@@ -93,15 +93,26 @@ function claimProblems(rec) {
 }
 
 /**
+ * A place-claim's (#136) `branch` field carries the SAME representation a claim's does — `null`
+ * for "the trunk checkout", a real name for a worktree, never the role word `trunk` — so it is
+ * validated through the identical `branchProblem` rather than inventing a second check.
+ */
+function placeProblems(rec) {
+  const b = branchProblem(rec && rec.branch);
+  return b ? [{ code: 'branch', message: b }] : [];
+}
+
+/**
  * The problem CODES each record carries right now — the "before" picture the guard compares
  * against. Cheap enough to take on every mutation, and it holds no values, so a mutation is free to
  * rewrite anything as long as it does not make a record worse.
  */
 function snapshot(st) {
-  const out = { worktrees: {}, claims: {} };
+  const out = { worktrees: {}, claims: {}, places: {} };
   if (!st) return out;
   for (const [k, w] of Object.entries(st.worktrees || {})) out.worktrees[k] = worktreeProblems(w).map((p) => p.code);
   for (const [k, c] of Object.entries(st.claims || {})) out.claims[k] = claimProblems(c).map((p) => p.code);
+  for (const [k, p] of Object.entries(st.places || {})) out.places[k] = placeProblems(p).map((x) => x.code);
   return out;
 }
 
@@ -130,6 +141,14 @@ function changedProblems(before, afterState) {
       if (isNew || !had.has(p.code)) out.push(`claim ${key}: ${p.message}`);
     }
   }
+  const prevP = (before && before.places) || {};
+  for (const [key, rec] of Object.entries((afterState && afterState.places) || {})) {
+    const had = new Set(prevP[key] || []);
+    const isNew = !Object.prototype.hasOwnProperty.call(prevP, key);
+    for (const p of placeProblems(rec)) {
+      if (isNew || !had.has(p.code)) out.push(`place ${key}: ${p.message}`);
+    }
+  }
   return out;
 }
 
@@ -143,5 +162,5 @@ function refusalMessage(problems) {
 
 module.exports = {
   ROLE_WORDS, PENDING, statusOf, branchProblem, pathProblem,
-  worktreeProblems, claimProblems, snapshot, changedProblems, refusalMessage,
+  worktreeProblems, claimProblems, placeProblems, snapshot, changedProblems, refusalMessage,
 };

@@ -109,4 +109,74 @@ function exitProblems(repoAbs, trunk) {
   return problems;
 }
 
-module.exports = { unpushedBranches, fullyDirty, entryProblems, exitProblems };
+/**
+ * Which write-conflict prevention method a repo's `project.yml` declares (`writes:` —
+ * CONVENTIONS.md §2 "Writes", project.schema.md "writes — optional"). Fails closed to
+ * `'isolated'` on anything unrecognised, the same direction `promotion:` fails closed
+ * (toward the safer, more-isolated reading) — never toward `serial`, which is the one
+ * that trusts a single writer.
+ */
+function writesMode(doc) {
+  const raw = doc && doc.writes;
+  return raw === 'serial' ? 'serial' : 'isolated';
+}
+
+/**
+ * Is solo flow (the serial trunk-direct cell) legal for this repo, and via which key?
+ * `writes: serial` is the current key; `ceremony: light` is accepted too, but only as a
+ * LEGACY proxy — see the comment inline. Returns `{ok:true, via}` or `{ok:false, reason}`.
+ */
+function soloEligibility(doc) {
+  if (writesMode(doc) === 'serial') return { ok: true, via: 'writes' };
+  // #133 re-keys this gate onto `writes: serial`. `ceremony: light` is still accepted, as a
+  // LEGACY proxy only, because no repo has answered the writes question yet and removing it
+  // here would break every light repo on the same commit that introduces its replacement.
+  // #175 (blocked on this issue) removes this legacy clause and the ceremony/production rule.
+  // Do not add a third acceptance path.
+  if (doc && doc.ceremony === 'light') return { ok: true, via: 'ceremony-legacy' };
+  return {
+    ok: false,
+    reason: 'solo flow requires writes: serial (or, legacy, ceremony: light) — this repo declares neither',
+  };
+}
+
+/**
+ * The two conditions from CONVENTIONS.md §2 ("Writes") that make a branch mandatory on a
+ * `writes: serial` repo, evaluated against state where it can be:
+ *
+ *   1. units-in-flight — more than one claim/worktree/place-claim already live on the repo.
+ *      Machine-decidable from `st`, so `met` is a real boolean.
+ *   2. pre-merge-gate — something (CI, review) must inspect the unit before it lands. This is
+ *      a DECLARED fact this module cannot see from git/state alone, so `met` is `null` — never
+ *      `false`. Returning `false` here would read as "no gate exists", which this function is
+ *      not positioned to claim.
+ *
+ * `mandatory` is `true` only when condition 1 is affirmatively met; a `null` condition 2 never
+ * flips `mandatory` to `true` on its own, because "cannot tell" must not read as "cannot apply".
+ */
+function branchMandatory(st, repoAbs) {
+  const wts = Object.values((st && st.worktrees) || {}).filter((w) => w.repo === repoAbs).length;
+  const claims = Object.entries((st && st.claims) || {}).filter(([k]) => k.startsWith(`${repoAbs}#`)).length;
+  const places = Object.values((st && st.places) || {}).filter((p) => p.repo === repoAbs).length;
+  const unitsInFlight = wts + claims + places;
+  const unitsMet = unitsInFlight > 1;
+
+  const conditions = [
+    {
+      id: 'units-in-flight',
+      met: unitsMet,
+      why: unitsMet
+        ? `${unitsInFlight} units in flight on this repo (worktrees+claims+place-claims) — more than one writer`
+        : `${unitsInFlight} unit(s) in flight — a single writer needs no branch on this condition alone`,
+    },
+    {
+      id: 'pre-merge-gate',
+      met: null,
+      why: 'not machine-decidable — a repo declares whether a unit must be inspected before landing; this check cannot see that fact',
+    },
+  ];
+
+  return { mandatory: unitsMet, conditions };
+}
+
+module.exports = { unpushedBranches, fullyDirty, entryProblems, exitProblems, writesMode, soloEligibility, branchMandatory };

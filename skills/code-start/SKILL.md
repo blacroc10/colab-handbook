@@ -97,21 +97,24 @@ cat .github/project.yml        # tier, trunk, production, deploy, stack, ports
   now, at step 4, because the base is what the session ships back into. Never cut
   from a branch that is not trunk and not declared there.
 
-### `ceremony: light`? Check the solo-flow shortcut before steps 2–4
+### `writes: serial`? Check the solo-flow shortcut before steps 2–4
 
-A `ceremony: light` repo (CONVENTIONS.md, *Solo flow*) may let this whole session skip
-issue, claim, and worktree — but only through the entry gate, never on your own say-so:
+A `writes: serial` repo (or, legacy, `ceremony: light` — CONVENTIONS.md, *Solo flow*)
+may let this whole session skip issue, claim, and worktree — but only through the entry
+gate, never on your own say-so:
 
 ```sh
 colab solo --session "$SESSION_URL" --session-name "<label>"
 ```
 
-- **`doc.ceremony` is not `light`** → `colab solo` refuses outright before checking
-  anything else. Continue at step 2 below as normal; solo flow does not apply here.
+- **Neither `doc.writes` is `serial` nor `doc.ceremony` is `light`** → `colab solo`
+  refuses outright before checking anything else. Continue at step 2 below as normal;
+  solo flow does not apply here.
 - **Refused for a held reason** (a worktree, a claim, an unpushed branch elsewhere, a
-  dirty tree, someone else's solo lock) → the repo qualifies in principle but ground
-  isn't clean *right now*. Report what was held and fall through to steps 2–4, full
-  ceremony — do not retry solo automatically; the holder is somebody's unfinished work.
+  dirty tree, someone else's solo lock, or a conflicting place-claim — CONVENTIONS.md,
+  *Place-claims*) → the repo qualifies in principle but ground isn't clean *right now*.
+  Report what was held and fall through to steps 2–4, full ceremony — do not retry solo
+  automatically; the holder is somebody's unfinished work.
 - **Opens** → this session may commit **straight to `<trunk>`** with plain Conventional
   Commits, no pre-filed issue and no worktree. Skip steps 2–4 entirely — there is
   nothing to load (no Issue is required to exist), nothing to claim, nothing to branch.
@@ -119,10 +122,17 @@ colab solo --session "$SESSION_URL" --session-name "<label>"
   as step 2, used on demand rather than as a gate). Go straight to committing the actual
   work, then close with **code-wrap's solo exit path** (`colab solo --done`) instead of
   its Phase A/B — there is no worktree to tear down and no claim to release, because
-  solo flow made neither.
+  solo flow made neither (though it does hold a place-claim on this checkout while open —
+  `--done` releases it).
 - Report the same as step 5's shape, minus what solo flow never created: no Issue URL
   unless you filed one, no branch/worktree line, and say plainly that this was a solo
   session so a reader does not go looking for a claim that was never made.
+- **On a `writes: serial` repo taken through the FULL flow instead** (a worktree/branch,
+  because one of the two mandatory-branch conditions applied), run `colab place check`
+  on the trunk checkout before your first write to it, and again before any command that
+  writes there directly (not inside your own worktree) — the place-claim is what a
+  writer OTHER than `colab solo`'s own gate can verify, and a coordinator-spawned
+  implementer session is exactly the writer a spawn-time lock alone cannot see.
 
 Never take this path on a hunch that "surely nobody else is touching this repo right
 now" — that is exactly the honor-system judgement the entry gate exists to replace with
