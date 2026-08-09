@@ -236,10 +236,16 @@ machine re-confirming what it had already confirmed. If a durable per-issue verd
 genuinely wanted, that is a new write needing its own idempotence rule — proposing one is
 out of scope for a triage pass to decide unilaterally by posting.
 
-**Publish only when the verdict changed, not on every re-measurement.** §0 re-running a full
-pass is not license to re-post writes 3-5 above if their conclusion did not move — each
-already carries its own grep-before-post check below; run that check before every post, not
-only the first one, and when nothing changed, post nothing.
+**"Only when changed" governs re-posting writes 3-5 — it authorises nothing new.**
+Re-running a full pass is not license to re-post the group / needs-plan / mechanical-lane
+records if their conclusion did not move — each carries its own grep-before-post check
+below; run it before every post, and when nothing changed, post nothing. A verdict that
+CHANGED or REVERSED since the last pass is still §6 console output: "this is an update, not
+a duplicate" does not convert the unauthorised sixth write into an authorised one. Banned
+forms include, by name: "Triage at trunk `<sha>` — …", "Triage re-measure — verdict
+CHANGED/REVERSED", corrections to either, and "final state of this pass" summaries. A
+verdict stamped to a trunk sha goes stale the next time trunk moves — minutes, in an active
+repo — which is exactly why the tracker is the wrong home for it.
 
 - **Dependency edges: read before writing.** `gh issue view <N> --json blockedBy` and skip
   the POST if the edge is already there. §4 writes edges; a second triage reaching the same
@@ -843,10 +849,11 @@ Hand the top group to **code-start**, which will re-verify the claim before taki
 ## Verify complete
 
 - **No write outside §0.2's five landed on the tracker.** In particular: no per-beat
-  narrative verdict comment, no restated §6 report, no "still ready, unchanged" note — the
-  report went to the console and nowhere else. A group's file-contention line, if reported
-  at all, named an actual path overlap with this group's own deliverables, not the
-  repo-wide worktree list.
+  narrative verdict comment, no "Triage at trunk `<sha>`" note, no "re-measure — verdict
+  CHANGED/REVERSED" update, no correction to any of these, no restated §6 report, no
+  "still ready, unchanged" note — the report went to the console and nowhere else. A
+  group's file-contention line, if reported at all, named an actual path overlap with this
+  group's own deliverables, not the repo-wide worktree list.
 - A run that short-circuited said so, named the timestamp it compared against, and
   re-printed a stored conclusion whose scope covers what was asked.
 - A run that proceeded wrote its fingerprint **and** its conclusion to `$CACHE`, so the
