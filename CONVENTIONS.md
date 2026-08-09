@@ -1004,14 +1004,17 @@ first two mechanically; `COLAB_SHIP` never opens `main`.
 **On Tier C the ladder has two rungs, not three, and the second is the deploy** —
 promotion there always requires `COLAB_HUMAN=1`; `promotion: main-loop` applies only
 where `deploy: tag` makes promotion verification-only, so it can never apply to C.
+Nothing about C widens what an agent may do: `autonomy: auto-trunk` still only ever
+merges into `dev`, which does not deploy.
 
 **Versioning** — SemVer. Patch for fixes, minor for features, major for breaking changes.
 Pre-1.0 repos use `v0.x.y`, treating minor as "meaningful increment".
 
 **Every tag gets a release summary** — a published GitHub Release grouping commits since
 the previous tag by Conventional-Commit type; `CHANGELOG.md` is not maintained by hand.
-[`templates/release-tag.yml`](templates/release-tag.yml) automates it. Manual fallback
-when the workflow cannot run:
+[`templates/release-tag.yml`](templates/release-tag.yml) automates it. When the
+workflow cannot run (Actions outage, billing lock — it has happened), the summary
+**is still owed**. Manual fallback, same output:
 
 ```sh
 colab release-notes v1.1.0..v1.2.0 | gh release create v1.2.0 --notes-file - --generate-notes
@@ -1020,9 +1023,9 @@ colab release-notes v1.1.0..v1.2.0 | gh release create v1.2.0 --notes-file - --g
 **Merged is not released — measure the gap, don't wait to notice it by eye.**
 `colab release-status [--repo P] [--json]` (#81) reports commits on `dev` not yet
 promoted, commits on `main` past the last `v*` tag (plus days since), and flags whichever
-gap holds a `fix:`-typed or breaking commit. Its suggested SemVer bump is advisory only.
-Measured against `main`, never `dev` — `git describe` from a `dev` checkout answers a
-stale question.
+gap holds a `fix:`-typed or breaking commit — exactly the class that has bitten before,
+in payroll. Its suggested SemVer bump is advisory only. Measured against `main`, never
+`dev` — `git describe` from a `dev` checkout answers a stale question.
 
 Do not tag from `dev`. Do not tag a commit that has not passed the full suite on `main`.
 
@@ -1058,7 +1061,9 @@ finding to report, not resolve quietly.
 **`requirements.txt` does not declare an interpreter** — pins dependencies only; a Python
 repo carrying only that file must add `python:` to `project.yml` or a `.python-version`.
 Measured: a Python repo adopted the handbook, found no Python template, and copied the
-Node one with `python-version: "3.13"` hardcoded in.
+Node one with `python-version: "3.13"` hardcoded in. **A missing template is not a
+neutral absence** — it redirects adoption into a worse form and leaves behind a file
+whose header lies about what it is.
 
 ### Test fixtures — neutralise ambient machine state, don't inherit it
 
