@@ -576,6 +576,19 @@ function makeSource(target) {
         const slug = githubSlugFromRemote(url);
         return slug ? listRemoteLabels(slug) : null;
       },
+      // Every tracked `*.md` path, repo-relative — used by the anchor-link check (#158).
+      // git-tracked, not a filesystem walk: an untracked scratch file citing a bogus
+      // anchor is not a repo finding. Empty array (not null) on any failure — the
+      // caller's contract is "nothing to check", not "unverifiable", because a local
+      // checkout with no `.md` files at all is a legitimate, silent pass.
+      markdownFiles: () => {
+        try {
+          const out = execFileSync("git", ["-C", root, "ls-files", "*.md"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+          return out.split("\n").map((s) => s.trim()).filter(Boolean);
+        } catch {
+          return [];
+        }
+      },
     };
   }
   return {
@@ -588,6 +601,11 @@ function makeSource(target) {
     currentBranch: () => null,
     isLinkedWorktree: () => false,
     labels: () => listRemoteLabels(target.slug),
+    // Anchor-link check is local-only by design (#158) — enumerating markdown remotely
+    // would be N `gh api` calls per repo across a fleet sweep. Empty list = the check
+    // scans nothing and emits nothing for a remote source, matching checkRunbook's
+    // "would rather under-report than invent" posture for API-backed reads.
+    markdownFiles: () => [],
   };
 }
 
@@ -787,6 +805,13 @@ function auditRepo(target, ctx) {
   // Unconditional: this is a repo-doc concern, not a tier/deploy one, and it applies to
   // the handbook's OWN CLAUDE.md too (not a stamp check, so it is not gated on !isSelf).
   checkClaudeMdSize(src, warn);
+
+  // ---- markdown anchor links resolve (#158) --------------------------------
+  // Unconditional, same posture as checkClaudeMdSize above: general markdown hygiene,
+  // not a stamp/tier concern, applies to the handbook's own docs unchanged. A `§N`
+  // prose citation is invisible to this on purpose — only an actual `](file#slug)`
+  // link is checked, so the ~280 not-yet-migrated citations produce zero findings.
+  checkAnchorLinks(src, fail);
 
   // ---- deploy workflow presence -------------------------------------------
   const workflows = src.listDir(".github/workflows").filter((f) => /\.ya?ml$/.test(f));
@@ -1153,6 +1178,115 @@ function splitDerivedSpans(text) {
   }
 
   return { authoredLines, malformed };
+}
+
+// Minimal GitHub-compatible heading→anchor slugifier (#158). GitHub's real algorithm is
+// unpublished; this is deliberately the common-case subset, calibrated against the 47
+// anchor links already live in this repo (CLAUDE.md, CONVENTIONS.md, README*.md,
+// project.schema.md, skills/handbook-sync/SKILL.md, tools/README.md) — every one of
+// them resolves under it. Not a general markdown-heading parser: it does not need to be,
+// because the only headings it is ever asked to slugify are the ones already governing
+// the links this check exists to validate.
+function slugifyHeading(text) {
+  return text
+    .replace(/`([^`]*)`/g, "$1") // code spans contribute their literal text, not backticks
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // [text](url) contributes only the text
+    .trim()
+    .replace(/#+$/, "") // a trailing "##" some repos use to mark a self-anchor
+    .toLowerCase()
+    .replace(/[^\w\- ]+/g, "") // strip punctuation, keep word chars/hyphens/spaces -- NOT collapsed
+    .trim()
+    // Each space/underscore becomes its OWN hyphen -- never collapsed. GitHub does not
+    // merge runs: a heading like "tier -- required" strips the em-dash but keeps both
+    // spaces around where it was, producing "tier--required" (double hyphen), and every
+    // link already written against a real heading in this repo is punctuated that way.
+    // Collapsing here silently breaks every one of them.
+    .replace(/[ _]/g, "-");
+}
+
+// Every heading in `text`, in document order, mapped to its resolved slug — including
+// GitHub's duplicate-slug suffixing (`-1`, `-2`, … in heading order, not alphabetical).
+// Fenced code blocks are skipped so a `#` inside a code sample is never read as a heading.
+function collectHeadingSlugs(text) {
+  const slugs = new Set();
+  const seen = new Map(); // base slug -> next suffix to try
+  let inFence = false;
+  for (const line of text.split("\n")) {
+    if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence) continue;
+    const m = /^#{1,6}\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    const base = slugifyHeading(m[1]);
+    if (!base) continue;
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    slugs.add(n === 0 ? base : `${base}-${n}`);
+  }
+  return slugs;
+}
+
+// Every `](target#fragment)` markdown link, repo-relative to the file that carries it.
+// `target` is `""` for a same-file link (`[…](#slug)`); anything already resolved by the
+// caller. Deliberately link-shaped ONLY — a bare `§N` in prose, or a bare `FILE.md#slug`
+// mention with no `[...](...)` around it, is not a citation this check may touch (#158's
+// whole scope boundary: the ~280 un-migrated `§N` citations must be invisible to this).
+const ANCHOR_LINK_RE = /\]\(([^)#\s]*\.md)?#([^)\s]+)\)/g;
+
+// Blanks out fenced code blocks and inline `code spans` before the link scan runs, so a
+// doc that shows link syntax as a LITERAL EXAMPLE (this very file does, documenting this
+// very check) is never mistaken for a real citation. Same fence-skip as
+// collectHeadingSlugs, plus a same-line inline-span strip; not a full markdown parser,
+// just enough to keep a documented example from tripping the thing it documents.
+function stripCodeForLinkScan(text) {
+  const out = [];
+  let inFence = false;
+  for (const line of text.split("\n")) {
+    if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; out.push(""); continue; }
+    out.push(inFence ? "" : line.replace(/`[^`\n]*`/g, ""));
+  }
+  return out.join("\n");
+}
+
+function checkAnchorLinks(src, fail) {
+  if (src.kind !== "local") return; // remote enumeration is O(files) gh API calls — skip, not warn (see markdownFiles())
+  const files = src.markdownFiles();
+  const headingCache = new Map(); // repo-relative path -> Set<slug> | null (null = unreadable)
+
+  const slugsFor = (path) => {
+    if (headingCache.has(path)) return headingCache.get(path);
+    const text = src.readFile(path);
+    const result = text === null ? null : collectHeadingSlugs(text);
+    headingCache.set(path, result);
+    return result;
+  };
+
+  for (const file of files) {
+    const text = src.readFile(file);
+    if (text === null) continue; // listed by git but unreadable — not this check's concern
+    const dir = dirname(file);
+    let m;
+    ANCHOR_LINK_RE.lastIndex = 0;
+    const scanText = stripCodeForLinkScan(text);
+    while ((m = ANCHOR_LINK_RE.exec(scanText))) {
+      const [, rawTarget, fragment] = m;
+      const targetPath = rawTarget ? (rawTarget.startsWith("/") ? rawTarget.slice(1) : join(dir, rawTarget)) : file;
+      // http(s):// and mailto: never match `.md$`, so they are already excluded by
+      // ANCHOR_LINK_RE requiring the target (when present) to end in ".md".
+      const normalized = targetPath.split("/").filter((p) => p !== ".").join("/");
+      const slugs = slugsFor(normalized);
+      if (slugs === null) {
+        fail(`${file}: links to ${normalized}#${fragment}, but ${normalized} does not exist`);
+        continue;
+      }
+      if (!slugs.has(fragment)) {
+        const near = [...slugs].slice(0, 5);
+        fail(
+          `${file}: anchor #${fragment} does not resolve in ${normalized} — ` +
+          (near.length ? `nearest headings: ${near.join(", ")}` : "that file has no headings at all"),
+        );
+      }
+    }
+  }
 }
 
 function checkClaudeMdSize(src, warn) {

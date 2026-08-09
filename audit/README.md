@@ -143,6 +143,33 @@ the handbook's current version, so a scheduled run is self-documenting.
   affected span as authored, so a broken marker can never hide real prose from the ceiling
   it exists to inform.
 
+- **Markdown anchor links resolve (#158)** — section numbers used to be cited by
+  number (`§5`) from ~20 files, and nothing checked them: a renumber broke every
+  reference silently, no CI failure, no advisory. The fix is anchor links, which
+  survive renumbering — and this check, so a *broken* link is loud instead:
+  - Scans every git-tracked `*.md` file in a **local** checkout (never remote — see
+    below) for link-shaped `](target#fragment)` references: same-file (`[…](#slug)`)
+    and cross-file, relative paths resolved against the *linking file's* directory.
+  - Resolves each target's headings with a minimal GitHub-compatible slugifier and
+    **fails** when a fragment doesn't match any of them, naming the file, the broken
+    anchor, and up to five nearby valid slugs. **Fail, not warn** — an unresolved
+    anchor is unambiguous once found, unlike the byte-ceiling checks above.
+  - **Deliberately link-shaped only.** A bare `§N` in prose, or a bare
+    `FILE.md#slug` mention with no `[...](...)` around it, is invisible to this
+    check by construction — that is what keeps a not-yet-migrated `§N` citation
+    (there are still ~280 of them, tracked by #183) out of scope.
+  - **Local sources only.** Enumerating markdown over the `gh` API would be
+    O(files) calls per repo across a fleet sweep; a remote source contributes no
+    finding at all, silently, rather than an advisory — the same "would rather
+    under-report than invent" posture `checkRunbook` takes for an API-backed miss.
+  - Runs unconditionally, same posture as the `CLAUDE.md` size check below: a
+    markdown-hygiene concern, not a stamp/tier one, and it applies to the
+    handbook's own docs unchanged (not gated on `isSelf`).
+  - **Slugifier gotcha, worth knowing if a link ever needs hand-writing:** GitHub
+    does not collapse the double space an em-dash leaves behind — a heading like
+    `` `tier` — required `` slugifies to `tier--required` (double hyphen), not
+    `tier-required`.
+
 - **Convention labels present on the tracker** (`in-progress`, `deps-checked`,
   `agent-filed`, `epic` — `tools/lib/labels.js`) — **advisory**, and only when the repo
   is adopted (has a `project.yml`) and the label set could actually be read (remote-less
