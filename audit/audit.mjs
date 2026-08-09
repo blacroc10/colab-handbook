@@ -1272,6 +1272,8 @@ function checkAnchorLinks(src, fail) {
       const targetPath = rawTarget ? (rawTarget.startsWith("/") ? rawTarget.slice(1) : join(dir, rawTarget)) : file;
       // http(s):// and mailto: never match `.md$`, so they are already excluded by
       // ANCHOR_LINK_RE requiring the target (when present) to end in ".md".
+            // Fully qualified URLs are not repo-relative links, even when they end in `.md#...`.
+      if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rawTarget)) continue;
       const normalized = targetPath.split("/").filter((p) => p !== ".").join("/");
       const slugs = slugsFor(normalized);
       if (slugs === null) {
